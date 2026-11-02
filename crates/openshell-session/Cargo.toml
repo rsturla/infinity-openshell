@@ -1,0 +1,32 @@
+[package]
+name = "openshell-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lease-managed OpenShell sandbox sessions for AI agents"
+keywords = ["openshell", "sandbox", "agents", "sessions"]
+categories = ["development-tools", "api-bindings"]
+
+[features]
+default = ["openshell"]
+openshell = ["dep:openshell-sdk"]
+bootstrap = ["dep:openshell-bootstrap"]
+testkit = []
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+openshell-sdk = { workspace = true, optional = true }
+openshell-bootstrap = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }

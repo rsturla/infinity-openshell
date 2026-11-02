@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/openshell-session"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/rsturla/infinity-openshell"
+homepage = "https://github.com/rsturla/infinity-openshell"
+authors = ["Robert Sturla"]
+
+[workspace.dependencies]
+async-trait = "0.1"
+bytes = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+openshell-sdk = { git = "https://github.com/NVIDIA/OpenShell", rev = "1afd9f69d118eefa6972c000830899f9c68d053a" }
+openshell-bootstrap = { git = "https://github.com/NVIDIA/OpenShell", rev = "1afd9f69d118eefa6972c000830899f9c68d053a" }
