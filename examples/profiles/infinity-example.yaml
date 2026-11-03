@@ -1,0 +1,43 @@
+# Example provider profile for the Infinity OpenShell network-access example.
+#
+# It grants a read-only GitHub API endpoint and binds GITHUB_TOKEN to that
+# endpoint. The `network_access` example imports this file and creates the
+# provider through the gateway API:
+#
+#   OPENSHELL_TEST_GATEWAY=demo \
+#     cargo run -p infinity-openshell --example network_access --features bootstrap
+#
+# The same operations are available from the CLI:
+#
+#   openshell profile lint -f examples/profiles/infinity-example.yaml -g demo
+#   openshell profile import -f examples/profiles/infinity-example.yaml -g demo
+#   openshell provider create -g demo \
+#     --name infinity-example --type infinity-example \
+#     --credential GITHUB_TOKEN=example-token
+#
+# The client binary path must exist in the workload image. The example uses
+# curlimages/curl, where curl is /usr/bin/curl.
+
+id: infinity-example
+display_name: Infinity Example API
+description: Read-only GitHub API access for the Infinity OpenShell example
+category: source_control
+
+credentials:
+  - name: api_token
+    description: GitHub token
+    env_vars: [GITHUB_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl

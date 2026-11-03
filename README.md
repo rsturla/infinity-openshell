@@ -62,6 +62,38 @@ Registration with Infinity:
 }
 ```
 
+## Network access, providers, and custom images
+
+A sandbox starts with no outbound network access. Manage the three layers from
+Rust, without the OpenShell CLI:
+
+```rust
+let mut config = RuntimeConfig::new(gateway);
+config.image = Some("curlimages/curl:8.10.1".to_owned());
+config.policy = Some(POLICY_YAML.to_owned());
+
+let admin = ProviderAdmin::connect(&config).await?;
+admin.ensure_profile(PROFILE_YAML, false).await?;
+admin
+    .ensure_provider(
+        &ProviderSpec::new("work-github", "github")
+            .credential("GITHUB_TOKEN", token),
+    )
+    .await?;
+
+config.providers = vec!["work-github".to_owned()];
+let runtime = SessionRuntime::open(config).await?;
+```
+
+- The policy authorizes traffic: binary, host, port, path, and method.
+- The profile declares credentials, endpoints, and binaries, and contributes
+  network rules to the sandbox.
+- The provider stores the credential values. The sandbox sees only a
+  placeholder.
+
+Read [Network access](docs/network-access.md) for the policy format, per-sandbox
+policy updates, and custom image requirements.
+
 ## Examples
 
 All examples are runnable and were validated against the demo gateway.
@@ -77,6 +109,12 @@ OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example live_sessi
 OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example live_rap --features bootstrap
 OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example live_streaming --features bootstrap
 OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example live_cancel --features bootstrap
+
+# Network access: provider profile, provider instance, custom image
+OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example network_access --features bootstrap
+
+# Create-time sandbox policy
+OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example live_policy --features bootstrap
 
 # Full Infinity agent -> RAP -> OpenShell
 OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example agent --features bootstrap
@@ -100,6 +138,7 @@ OPENSHELL_TEST_GATEWAY=demo cargo test --features bootstrap -- --ignored
 ## Documentation
 
 - [Production design](docs/production-design.md)
+- [Network access, providers, and custom images](docs/network-access.md)
 - [Journal and HA deployments](docs/ha-journal.md)
 - [RAP callbacks beyond tool results](docs/rap-callbacks.md)
 

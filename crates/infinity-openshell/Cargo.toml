@@ -58,6 +58,16 @@ path = "examples/live_session.rs"
 required-features = ["bootstrap"]
 
 [[example]]
+name = "network_access"
+path = "examples/network_access.rs"
+required-features = ["bootstrap"]
+
+[[example]]
+name = "live_policy"
+path = "examples/live_policy.rs"
+required-features = ["bootstrap"]
+
+[[example]]
 name = "live_rap"
 path = "examples/live_rap.rs"
 required-features = ["bootstrap"]
