@@ -120,6 +120,24 @@ OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example live_polic
 OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example agent --features bootstrap
 ```
 
+### Go agent loop
+
+The RAP seam is HTTP/JSON, so the agent loop can be Go while the sandbox
+lifecycle stays in Rust. The Go process calls `/invoke`, serves the callback
+URL, and never touches OpenShell.
+
+```shell
+# Terminal 1
+cargo run --features cli --bin infinity-openshell -- serve \
+  --gateway demo --base-url http://127.0.0.1:3001
+
+# Terminal 2
+cd examples/go-agent
+go run .
+```
+
+See [examples/go-agent](examples/go-agent/README.md).
+
 ## Build and test
 
 ```shell
@@ -127,6 +145,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ./scripts/check-separation.sh
+(cd examples/go-agent && go vet ./... && go build ./...)
 ```
 
 Live tests:
