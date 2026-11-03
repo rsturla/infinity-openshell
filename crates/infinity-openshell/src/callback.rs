@@ -16,6 +16,9 @@ pub enum CallbackError {
     /// The receiver returned a non-success status.
     #[error("callback returned HTTP {0}")]
     Rejected(u16),
+    /// SigV4 signing failed.
+    #[error("callback signing failed: {0}")]
+    Signing(String),
 }
 
 /// Delivers RAP callback messages.
@@ -73,6 +76,148 @@ impl CallbackClient for PlainCallbackClient {
             .http
             .post(url)
             .json(callback)
+            .send()
+            .await
+            .map_err(|error| CallbackError::Transport(sanitize_reqwest(error)))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(CallbackError::Rejected(status.as_u16()));
+        }
+        Ok(())
+    }
+}
+
+/// SigV4-signed callback client for Lambda Function URLs and IAM-protected
+/// endpoints.
+#[cfg(feature = "sigv4")]
+#[derive(Clone)]
+pub struct SigV4CallbackClient {
+    http: reqwest::Client,
+    credentials: aws_credential_types::provider::SharedCredentialsProvider,
+    region: String,
+    service: String,
+    allowed_hosts: Vec<String>,
+    allow_insecure_http: bool,
+}
+
+#[cfg(feature = "sigv4")]
+impl SigV4CallbackClient {
+    /// Build a client with the AWS default credential chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport or signing-configuration error.
+    pub async fn from_environment(
+        timeout: Duration,
+        allowed_hosts: Vec<String>,
+        allow_insecure_http: bool,
+        region: Option<String>,
+        service: impl Into<String>,
+    ) -> Result<Self, CallbackError> {
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let credentials = config
+            .credentials_provider()
+            .ok_or_else(|| CallbackError::Signing("no AWS credentials provider".to_owned()))?;
+        let region = region
+            .or_else(|| config.region().map(ToString::to_string))
+            .unwrap_or_else(|| "us-east-1".to_owned());
+        Self::new(
+            credentials,
+            region,
+            service,
+            allowed_hosts,
+            allow_insecure_http,
+            timeout,
+        )
+    }
+
+    /// Build a client with explicit credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error when the HTTP client cannot be built.
+    pub fn new(
+        credentials: aws_credential_types::provider::SharedCredentialsProvider,
+        region: impl Into<String>,
+        service: impl Into<String>,
+        allowed_hosts: Vec<String>,
+        allow_insecure_http: bool,
+        timeout: Duration,
+    ) -> Result<Self, CallbackError> {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| CallbackError::Transport(sanitize_reqwest(error)))?;
+        Ok(Self {
+            http,
+            credentials,
+            region: region.into(),
+            service: service.into(),
+            allowed_hosts,
+            allow_insecure_http,
+        })
+    }
+}
+
+#[cfg(feature = "sigv4")]
+#[async_trait]
+impl CallbackClient for SigV4CallbackClient {
+    async fn post(&self, url: &str, callback: &RapCallback) -> Result<(), CallbackError> {
+        use aws_credential_types::provider::ProvideCredentials;
+        use aws_sigv4::http_request::{
+            SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
+        };
+        use aws_sigv4::sign::v4::SigningParams;
+        use aws_smithy_runtime_api::client::identity::Identity;
+
+        let url =
+            url::Url::parse(url).map_err(|error| CallbackError::InvalidUrl(error.to_string()))?;
+        validate_callback_url(&url, &self.allowed_hosts, self.allow_insecure_http)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| CallbackError::InvalidUrl("missing host".to_owned()))?
+            .to_owned();
+        let body = serde_json::to_vec(callback)
+            .map_err(|error| CallbackError::Transport(error.to_string()))?;
+        let credentials = self
+            .credentials
+            .provide_credentials()
+            .await
+            .map_err(|error| CallbackError::Signing(error.to_string()))?;
+        let identity = Identity::new(credentials, None);
+        let mut settings = SigningSettings::default();
+        settings.signature_location = SignatureLocation::Headers;
+        let params = SigningParams::builder()
+            .identity(&identity)
+            .region(&self.region)
+            .name(&self.service)
+            .time(std::time::SystemTime::now())
+            .settings(settings)
+            .build()
+            .map_err(|error| CallbackError::Signing(error.to_string()))?;
+        let request = SignableRequest::new(
+            "POST",
+            url.as_str(),
+            std::iter::once(("host", host.as_str()))
+                .chain(std::iter::once(("content-type", "application/json"))),
+            SignableBody::Bytes(&body),
+        )
+        .map_err(|error| CallbackError::Signing(error.to_string()))?;
+        let (instructions, _) = sign(request, &params.into())
+            .map_err(|error| CallbackError::Signing(error.to_string()))?
+            .into_parts();
+
+        let mut request = self
+            .http
+            .post(url)
+            .header("host", &host)
+            .header("content-type", "application/json");
+        for (name, value) in instructions.headers() {
+            request = request.header(name, value);
+        }
+        let response = request
+            .body(body)
             .send()
             .await
             .map_err(|error| CallbackError::Transport(sanitize_reqwest(error)))?;
@@ -144,7 +289,8 @@ fn sanitize_reqwest(error: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    #[cfg(feature = "sigv4")]
+    use rap_protocol::{RapToolResult, ThreadId, ToolCallId};
     fn url(value: &str) -> url::Url {
         url::Url::parse(value).unwrap()
     }
@@ -180,5 +326,79 @@ mod tests {
             validate_callback_url(&url("https://user:pass@example.com/cb"), &[], false).is_err()
         );
         assert!(validate_callback_url(&url("https://example.com/cb#frag"), &[], false).is_err());
+    }
+
+    #[cfg(feature = "sigv4")]
+    #[tokio::test]
+    async fn sigv4_signs_with_the_configured_region_and_service() {
+        use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
+        use axum::Router;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/cb",
+            post(move |headers: HeaderMap| {
+                let sender = sender.clone();
+                async move {
+                    let authorization = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let _ = sender.send(authorization);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = SharedCredentialsProvider::new(Credentials::new(
+            "AKIDEXAMPLE",
+            "secret",
+            None,
+            None,
+            "test",
+        ));
+        let client = SigV4CallbackClient::new(
+            provider,
+            "us-east-1",
+            "lambda",
+            Vec::new(),
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let result = RapToolResult {
+            group_id: ThreadId::from("thread-1"),
+            id: ToolCallId::from("call-1"),
+            call_id: None,
+            text: Some("ok".to_owned()),
+            content: None,
+            display_as: None,
+            subscription: None,
+        };
+        client
+            .post(
+                &format!("http://127.0.0.1:{port}/cb"),
+                &RapCallback::ToolResult(result),
+            )
+            .await
+            .unwrap();
+
+        let authorization = receiver.recv().await.unwrap();
+        assert!(
+            authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
+            "authorization: {authorization}"
+        );
+        assert!(
+            authorization.contains("/us-east-1/lambda/aws4_request"),
+            "authorization: {authorization}"
+        );
     }
 }

@@ -4,19 +4,26 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
-use openshell_session::{ExecRequest, SandboxPath, SessionKey, SessionRuntime, ThreadId};
-use rap_protocol::{RapCallback, RapInvocation, RapToolResult};
+use futures_util::StreamExt;
+use openshell_session::{
+    ExecEvent, ExecOutput, ExecRequest, SandboxPath, SessionKey, SessionRuntime, ThreadId,
+};
+use rap_protocol::{RapCallback, RapInvocation, RapSubscriptionEvent, RapToolResult};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "sigv4")]
+use crate::callback::SigV4CallbackClient;
 use crate::callback::{CallbackClient, CallbackError, PlainCallbackClient};
-use crate::config::{InboundAuth, ServerConfig};
+use crate::config::{CallbackAuth, InboundAuth, ServerConfig};
 use crate::error::Error;
 use crate::journal::{Accept, FileJournal, Journal, MemoryJournal};
 use crate::toolset;
@@ -45,14 +52,7 @@ struct AppState {
 /// Returns a configuration, journal, or callback client error.
 pub async fn router(runtime: SessionRuntime, config: ServerConfig) -> Result<Router, Error> {
     config.validate()?;
-    let callback = Arc::new(
-        PlainCallbackClient::new(
-            config.callback_timeout,
-            config.callback_allowed_hosts.clone(),
-            config.allow_insecure_callback_http,
-        )
-        .map_err(|error| Error::Callback(error.to_string()))?,
-    );
+    let callback = build_callback(&config).await?;
     let journal: Arc<dyn Journal> = if let Some(path) = &config.journal_path {
         Arc::new(FileJournal::open(path).await?)
     } else {
@@ -87,14 +87,68 @@ pub async fn router_with_callback(
     });
     recover_pending(&state).await?;
     start_outbox(&state);
-    Ok(Router::new()
-        .route("/.well-known/rap-toolset", get(toolset_handler))
+    let protected = Router::new()
         .route("/invoke", post(invoke_handler))
         .route("/close_thread", post(close_thread_handler))
         .route("/cancel_tool_call", post(cancel_tool_call_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+    Ok(Router::new()
+        .route("/.well-known/rap-toolset", get(toolset_handler))
         .route("/healthz", get(health_handler))
         .route("/readyz", get(health_handler))
+        .merge(protected)
         .with_state(state))
+}
+
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if authorized(&state.config, request.headers()) {
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+async fn build_callback(config: &ServerConfig) -> Result<Arc<dyn CallbackClient>, Error> {
+    match &config.callback_auth {
+        CallbackAuth::Plain => Ok(Arc::new(
+            PlainCallbackClient::new(
+                config.callback_timeout,
+                config.callback_allowed_hosts.clone(),
+                config.allow_insecure_callback_http,
+            )
+            .map_err(|error| Error::Callback(error.to_string()))?,
+        )),
+        CallbackAuth::SigV4 { region, service } => {
+            #[cfg(feature = "sigv4")]
+            {
+                Ok(Arc::new(
+                    SigV4CallbackClient::from_environment(
+                        config.callback_timeout,
+                        config.callback_allowed_hosts.clone(),
+                        config.allow_insecure_callback_http,
+                        region.clone(),
+                        service.clone(),
+                    )
+                    .await
+                    .map_err(|error| Error::Callback(error.to_string()))?,
+                ))
+            }
+            #[cfg(not(feature = "sigv4"))]
+            {
+                let _ = (region, service);
+                Err(Error::InvalidConfig(
+                    "SigV4 callback auth requires the 'sigv4' feature".to_owned(),
+                ))
+            }
+        }
+    }
 }
 
 async fn recover_pending(state: &Arc<AppState>) -> Result<(), Error> {
@@ -155,13 +209,8 @@ async fn health_handler() -> StatusCode {
 
 async fn invoke_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(invocation): Json<RapInvocation>,
 ) -> StatusCode {
-    if !authorized(&state.config, &headers) {
-        return StatusCode::UNAUTHORIZED;
-    }
-
     match state.journal.accept(&invocation).await {
         Ok(Accept::New) => {}
         Ok(Accept::DuplicatePending) => {
@@ -251,7 +300,12 @@ async fn process(state: Arc<AppState>, invocation: RapInvocation, token: Cancell
         "Error: thread is closed".to_owned()
     } else {
         match tokio::select! {
-            _ = token.cancelled() => Err(Error::Cancelled),
+            _ = token.cancelled() => {
+                if invocation.operation == "openshell_exec" {
+                    send_event(&state, &invocation, "[cancelled]".to_owned(), true).await;
+                }
+                Err(Error::Cancelled)
+            }
             result = execute(&state, &invocation) => result,
         } {
             Ok(text) => text,
@@ -288,8 +342,82 @@ async fn execute(state: &AppState, invocation: &RapInvocation) -> Result<String,
             let mut request = ExecRequest::new(args.command);
             request.workdir = args.cwd;
             request.stdin = args.stdin.map(Bytes::from);
-            let output = session.exec(request).await?;
-            Ok(render_exec(&output))
+            request.request_id = Some(openshell_session::request_id_from(invocation.id.as_str()));
+            request.max_output_bytes = state.config.max_output_bytes;
+
+            let mut stream = session.exec_stream(request).await?;
+            let cap = state
+                .config
+                .max_output_bytes
+                .min(session.max_output_bytes());
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut remaining = cap;
+            let mut exit_code = -1;
+            let mut truncated = false;
+            let mut pending = String::new();
+            let mut carry = Vec::new();
+            let mut ticker = tokio::time::interval(state.config.stream_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if !pending.is_empty() {
+                            let text = std::mem::take(&mut pending);
+                            send_event(state, invocation, text, false).await;
+                        }
+                    }
+                    event = stream.next() => {
+                        match event {
+                            Some(Ok(ExecEvent::Stdout(chunk))) => {
+                                decode_chunk(&mut pending, &mut carry, &chunk);
+                                append_capped(
+                                    &mut stdout,
+                                    &chunk,
+                                    &mut remaining,
+                                    &mut truncated,
+                                );
+                            }
+                            Some(Ok(ExecEvent::Stderr(chunk))) => {
+                                decode_chunk(&mut pending, &mut carry, &chunk);
+                                append_capped(
+                                    &mut stderr,
+                                    &chunk,
+                                    &mut remaining,
+                                    &mut truncated,
+                                );
+                            }
+                            Some(Ok(ExecEvent::Exited { code })) => {
+                                exit_code = code;
+                                break;
+                            }
+                            Some(Err(error)) => {
+                                send_event(state, invocation, format!("Error: {error}"), true).await;
+                                return Err(Error::Session(error));
+                            }
+                            None => break,
+                        }
+                        if pending.len() >= 64 * 1024 {
+                            let text = std::mem::take(&mut pending);
+                            send_event(state, invocation, text, false).await;
+                        }
+                    }
+                }
+            }
+
+            if !pending.is_empty() {
+                send_event(state, invocation, pending, false).await;
+            }
+            send_event(state, invocation, format!("[exit {exit_code}]"), true).await;
+
+            Ok(render_exec(&ExecOutput {
+                code: exit_code,
+                stdout: Bytes::from(stdout),
+                stderr: Bytes::from(stderr),
+                truncated,
+            }))
         }
         "openshell_read" => {
             let args: ReadArgs = parse_args(invocation)?;
@@ -307,7 +435,10 @@ async fn execute(state: &AppState, invocation: &RapInvocation) -> Result<String,
             let path = SandboxPath::new(args.path)
                 .map_err(|error| Error::InvalidArguments(error.to_string()))?;
             let session = acquire(state, invocation).await?;
-            session.write_file(&path, args.content.into_bytes()).await?;
+            let request_id = openshell_session::request_id_from(invocation.id.as_str());
+            session
+                .write_file_with_request_id(&path, args.content.into_bytes(), Some(&request_id))
+                .await?;
             Ok(format!("Wrote {}", path.as_str()))
         }
         other => Err(Error::InvalidArguments(format!(
@@ -351,26 +482,25 @@ async fn deliver_many(state: &AppState, primary: &str, extras: &[String], result
 }
 
 async fn deliver_direct(state: &AppState, callback_url: &str, result: &RapToolResult) -> Delivery {
-    let callback = RapCallback::ToolResult(result.clone());
+    post_callback(
+        state,
+        callback_url,
+        &RapCallback::ToolResult(result.clone()),
+    )
+    .await
+}
+
+async fn post_callback(state: &AppState, callback_url: &str, callback: &RapCallback) -> Delivery {
     let mut delay = state.config.callback_backoff;
     for attempt in 0..state.config.callback_attempts {
-        match state.callback.post(callback_url, &callback).await {
+        match state.callback.post(callback_url, callback).await {
             Ok(()) => return Delivery::Delivered,
             Err(CallbackError::Rejected(code)) if (400..500).contains(&code) => {
-                tracing::warn!(
-                    call_id = %result.id,
-                    code,
-                    "callback receiver rejected the result; not retrying"
-                );
+                tracing::warn!(code, "callback receiver rejected the message; not retrying");
                 return Delivery::Terminal;
             }
             Err(error) => {
-                tracing::warn!(
-                    attempt,
-                    call_id = %result.id,
-                    %error,
-                    "callback delivery failed"
-                );
+                tracing::warn!(attempt, %error, "callback delivery failed");
                 if attempt + 1 < state.config.callback_attempts {
                     tokio::time::sleep(delay).await;
                     delay = delay.saturating_mul(2);
@@ -378,8 +508,59 @@ async fn deliver_direct(state: &AppState, callback_url: &str, result: &RapToolRe
             }
         }
     }
-    tracing::error!(call_id = %result.id, "callback delivery exhausted");
+    tracing::error!("callback delivery exhausted");
     Delivery::Retry
+}
+
+async fn send_event(state: &AppState, invocation: &RapInvocation, text: String, final_: bool) {
+    let event = RapCallback::SubscriptionEvent(RapSubscriptionEvent {
+        group_id: invocation.group_id.clone(),
+        tool_call_id: invocation.id.clone(),
+        text,
+        associative: true,
+        r#final: final_.then_some(true),
+    });
+    let _ = post_callback(state, &invocation.callback_url, &event).await;
+}
+
+fn append_capped(target: &mut Vec<u8>, chunk: &[u8], remaining: &mut usize, truncated: &mut bool) {
+    let take = chunk.len().min(*remaining);
+    target.extend_from_slice(&chunk[..take]);
+    *remaining -= take;
+    if take < chunk.len() {
+        *truncated = true;
+    }
+}
+
+fn decode_chunk(pending: &mut String, carry: &mut Vec<u8>, chunk: &[u8]) {
+    carry.extend_from_slice(chunk);
+    loop {
+        match std::str::from_utf8(carry) {
+            Ok(text) => {
+                pending.push_str(text);
+                carry.clear();
+                return;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let text = std::str::from_utf8(&carry[..valid])
+                        .expect("a validated UTF-8 prefix is valid");
+                    pending.push_str(text);
+                }
+                match error.error_len() {
+                    Some(invalid) => {
+                        pending.push('\u{FFFD}');
+                        carry.drain(..valid + invalid);
+                    }
+                    None => {
+                        carry.drain(..valid);
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn merge_delivery(left: Delivery, right: Delivery) -> Delivery {
@@ -392,12 +573,8 @@ fn merge_delivery(left: Delivery, right: Delivery) -> Delivery {
 
 async fn close_thread_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(request): Json<ThreadRequest>,
 ) -> StatusCode {
-    if !authorized(&state.config, &headers) {
-        return StatusCode::UNAUTHORIZED;
-    }
     let thread = request.thread_id.as_str().to_owned();
     state.closed_threads.lock().await.insert(thread.clone());
 
@@ -427,12 +604,8 @@ async fn close_thread_handler(
 
 async fn cancel_tool_call_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(request): Json<CancelRequest>,
 ) -> StatusCode {
-    if !authorized(&state.config, &headers) {
-        return StatusCode::UNAUTHORIZED;
-    }
     let inflight = state
         .inflight
         .lock()
@@ -520,6 +693,9 @@ fn render_exec(output: &openshell_session::ExecOutput) -> String {
     } else if !text.ends_with('\n') {
         text.push('\n');
     }
+    if output.truncated {
+        text.push_str("[truncated]\n");
+    }
     text.push_str(&format!("[exit {}]", output.code));
     text
 }
@@ -577,4 +753,44 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
             difference | (*left ^ *right)
         })
         == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_cap_is_shared_between_channels() {
+        let mut remaining = 5;
+        let mut truncated = false;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        append_capped(&mut stdout, b"abc", &mut remaining, &mut truncated);
+        append_capped(&mut stderr, b"def", &mut remaining, &mut truncated);
+        assert_eq!(stdout, b"abc");
+        assert_eq!(stderr, b"de");
+        assert_eq!(remaining, 0);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn split_utf8_is_reassembled() {
+        let mut pending = String::new();
+        let mut carry = Vec::new();
+        let text = "héllo";
+        let bytes = text.as_bytes();
+        decode_chunk(&mut pending, &mut carry, &bytes[..2]);
+        decode_chunk(&mut pending, &mut carry, &bytes[2..]);
+        assert_eq!(pending, text);
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn invalid_utf8_becomes_a_replacement_character() {
+        let mut pending = String::new();
+        let mut carry = Vec::new();
+        decode_chunk(&mut pending, &mut carry, &[0xff, b'a']);
+        assert_eq!(pending, "\u{FFFD}a");
+        assert!(carry.is_empty());
+    }
 }

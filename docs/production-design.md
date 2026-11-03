@@ -591,9 +591,12 @@ pub enum Accept {
 
 OpenShell's durable admission is used deliberately:
 
-- create/start/exec carry `request_id = hash(tenant, thread, tool_call_id)`.
-- A retry of the same invocation reuses the same ID, so the gateway can replay a
-  confirmed success instead of running again.
+- exec and file writes carry `request_id = hash(tool_call_id)`.
+- A retry of the same invocation reuses the same ID. The gateway admits it once
+  and rejects a duplicate mutation instead of running it again.
+- The pinned gateway does not replay the output of a completed exec. A retry of
+  a completed call therefore fails with `REQUEST_STREAM_UNAVAILABLE` rather than
+  returning the earlier result.
 - `REQUEST_OUTCOME_UNCERTAIN` and `REQUEST_STREAM_UNAVAILABLE` mean the effect may
   have happened. Do **not** retry with a new ID. Mark the record
   `NeedsReconcile`, deliver an actionable error, and let an operator or a

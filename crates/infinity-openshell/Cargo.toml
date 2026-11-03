@@ -13,23 +13,78 @@ categories = ["development-tools", "api-bindings"]
 [features]
 default = []
 bootstrap = ["openshell-session/bootstrap"]
+sigv4 = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api"]
+cli = ["dep:clap", "dep:tracing-subscriber", "openshell-session/bootstrap"]
 
 [dependencies]
 async-trait.workspace = true
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
 axum.workspace = true
 bytes.workspace = true
+clap = { version = "4", features = ["derive", "env"], optional = true }
+futures-util.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 openshell-session = { path = "../openshell-session" }
 rap-protocol.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "signal"] }
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 
+[[bin]]
+name = "infinity-openshell"
+path = "src/bin/infinity-openshell.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "fake_end_to_end"
+path = "examples/fake_end_to_end.rs"
+
+[[example]]
+name = "agent"
+path = "examples/agent.rs"
+required-features = ["bootstrap"]
+
+[[example]]
+name = "live_session"
+path = "examples/live_session.rs"
+required-features = ["bootstrap"]
+
+[[example]]
+name = "live_rap"
+path = "examples/live_rap.rs"
+required-features = ["bootstrap"]
+
+[[example]]
+name = "live_streaming"
+path = "examples/live_streaming.rs"
+required-features = ["bootstrap"]
+
+[[example]]
+name = "live_cancel"
+path = "examples/live_cancel.rs"
+required-features = ["bootstrap"]
+
+[[example]]
+name = "journal_recovery"
+path = "examples/journal_recovery.rs"
+
+[[example]]
+name = "sigv4_callback"
+path = "examples/sigv4_callback.rs"
+required-features = ["sigv4"]
+
 [dev-dependencies]
+infinity-agent-core = { git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b" }
+infinity-provider-protocol = { git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b" }
+infinity-rap-bridge = { git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b" }
 openshell-bootstrap.workspace = true
 openshell-session = { path = "../openshell-session", features = ["testkit", "bootstrap"] }
 rap-client = { git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b" }

@@ -34,6 +34,22 @@ impl fmt::Debug for InboundAuth {
     }
 }
 
+/// How the server authenticates callback delivery.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub enum CallbackAuth {
+    /// Plain HTTP POST.
+    #[default]
+    Plain,
+    /// AWS SigV4 signing with the default credential chain.
+    SigV4 {
+        /// Signing region. `None` uses the AWS default region.
+        region: Option<String>,
+        /// Signing service, usually `lambda`.
+        service: String,
+    },
+}
+
 /// RAP server configuration.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -45,6 +61,8 @@ pub struct ServerConfig {
     pub toolset_name: String,
     /// Incoming request authentication.
     pub inbound_auth: InboundAuth,
+    /// Callback delivery authentication.
+    pub callback_auth: CallbackAuth,
     /// Optional append-only journal path. `None` keeps the journal in memory.
     pub journal_path: Option<PathBuf>,
     /// HTTP timeout for one callback attempt.
@@ -57,6 +75,10 @@ pub struct ServerConfig {
     pub callback_allowed_hosts: Vec<String>,
     /// Allow non-loopback plain HTTP callback URLs. Development only.
     pub allow_insecure_callback_http: bool,
+    /// How often to emit a subscription event while a command streams.
+    pub stream_interval: Duration,
+    /// Maximum bytes retained for one tool result.
+    pub max_output_bytes: usize,
 }
 
 impl ServerConfig {
@@ -67,12 +89,15 @@ impl ServerConfig {
             tenant,
             toolset_name: "openshell-sandbox".to_owned(),
             inbound_auth: InboundAuth::None,
+            callback_auth: CallbackAuth::Plain,
             journal_path: None,
             callback_timeout: Duration::from_secs(10),
             callback_attempts: 5,
             callback_backoff: Duration::from_millis(250),
             callback_allowed_hosts: Vec::new(),
             allow_insecure_callback_http: false,
+            stream_interval: Duration::from_secs(10),
+            max_output_bytes: 1024 * 1024,
         }
     }
 
@@ -115,6 +140,23 @@ impl ServerConfig {
         {
             return Err(Error::InvalidConfig(
                 "callback_allowed_hosts must contain non-empty host names".to_owned(),
+            ));
+        }
+        if self.stream_interval.is_zero() {
+            return Err(Error::InvalidConfig(
+                "stream_interval must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_output_bytes == 0 {
+            return Err(Error::InvalidConfig(
+                "max_output_bytes must be greater than zero".to_owned(),
+            ));
+        }
+        if let CallbackAuth::SigV4 { service, .. } = &self.callback_auth
+            && service.trim().is_empty()
+        {
+            return Err(Error::InvalidConfig(
+                "SigV4 callback service must not be empty".to_owned(),
             ));
         }
         Ok(())

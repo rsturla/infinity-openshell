@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/openshell-session", "crates/infinity-openshell"]
+members = [
+    "crates/openshell-session",
+    "crates/infinity-openshell",
+    "crates/infinity-openshell-testkit",
+]
 
 [workspace.package]
 version = "0.1.0"

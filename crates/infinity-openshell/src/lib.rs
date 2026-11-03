@@ -46,8 +46,10 @@ mod journal;
 mod server;
 mod toolset;
 
+#[cfg(feature = "sigv4")]
+pub use callback::SigV4CallbackClient;
 pub use callback::{CallbackClient, CallbackError, PlainCallbackClient};
-pub use config::{InboundAuth, ServerConfig};
+pub use config::{CallbackAuth, InboundAuth, ServerConfig};
 pub use error::Error;
 pub use journal::{Accept, FileJournal, Journal, MemoryJournal, Pending};
 pub use server::{router, router_with_callback};

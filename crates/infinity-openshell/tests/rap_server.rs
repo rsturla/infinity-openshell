@@ -10,8 +10,8 @@ use axum::http::{Request, StatusCode};
 use openshell_session::fake::FakeGateway;
 use openshell_session::{GatewayAuth, GatewayConfig, RuntimeConfig, SessionRuntime, TenantId};
 use rap_protocol::{
-    ProviderCallId, RapCallback, RapInvocation, RapToolResult, ThreadId, ToolCallId,
-    ToolsetManifest,
+    ProviderCallId, RapCallback, RapInvocation, RapSubscriptionEvent, RapToolResult, ThreadId,
+    ToolCallId, ToolsetManifest,
 };
 use tokio::sync::mpsc;
 use tower::ServiceExt;
@@ -25,13 +25,20 @@ use infinity_openshell::{
 #[derive(Clone)]
 struct RecordingCallback {
     results: mpsc::UnboundedSender<RapToolResult>,
+    events: mpsc::UnboundedSender<RapSubscriptionEvent>,
 }
 
 #[async_trait]
 impl CallbackClient for RecordingCallback {
     async fn post(&self, _url: &str, callback: &RapCallback) -> Result<(), CallbackError> {
-        if let RapCallback::ToolResult(result) = callback {
-            let _ = self.results.send(result.clone());
+        match callback {
+            RapCallback::ToolResult(result) => {
+                let _ = self.results.send(result.clone());
+            }
+            RapCallback::SubscriptionEvent(event) => {
+                let _ = self.events.send(event.clone());
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -41,6 +48,7 @@ struct Harness {
     app: Router,
     gateway: Arc<FakeGateway>,
     results: mpsc::UnboundedReceiver<RapToolResult>,
+    events: mpsc::UnboundedReceiver<RapSubscriptionEvent>,
 }
 
 async fn harness_with_auth(auth: InboundAuth) -> Harness {
@@ -63,9 +71,11 @@ async fn harness_with_auth_and_journal(auth: InboundAuth, journal: Arc<dyn Journ
     config.inbound_auth = auth;
     config.callback_attempts = 2;
     config.callback_backoff = Duration::from_millis(1);
+    config.stream_interval = Duration::from_millis(5);
 
     let (results, receiver) = mpsc::unbounded_channel();
-    let callback = Arc::new(RecordingCallback { results });
+    let (events, event_receiver) = mpsc::unbounded_channel();
+    let callback = Arc::new(RecordingCallback { results, events });
     let app = router_with_callback(runtime, config, journal, callback)
         .await
         .unwrap();
@@ -73,6 +83,7 @@ async fn harness_with_auth_and_journal(auth: InboundAuth, journal: Arc<dyn Journ
         app,
         gateway,
         results: receiver,
+        events: event_receiver,
     }
 }
 
@@ -159,6 +170,97 @@ async fn exec_runs_in_the_sandbox_and_delivers_a_result() {
     );
     assert_eq!(count(&harness.gateway, "create"), 1);
     assert_eq!(count(&harness.gateway, "exec"), 1);
+    let execs = harness.gateway.all_execs();
+    assert_eq!(
+        execs[0].request_id.as_deref(),
+        Some(openshell_session::request_id_from("call-1").as_str())
+    );
+}
+
+#[tokio::test]
+async fn exec_emits_subscription_events_before_the_result() {
+    let mut harness = harness().await;
+    harness.gateway.set_next_stdout("streamed\n");
+    harness.gateway.set_exec_delay(Duration::from_millis(25));
+    let invocation = invocation(
+        "call-stream",
+        "openshell_exec",
+        serde_json::json!({"command": ["printf", "streamed"]}),
+    );
+    assert_eq!(invoke(&harness.app, &invocation).await, StatusCode::OK);
+
+    let event = tokio::time::timeout(Duration::from_secs(2), harness.events.recv())
+        .await
+        .expect("subscription event timed out")
+        .expect("event channel closed");
+    assert!(event.text.contains("streamed"), "event: {event:?}");
+    assert_eq!(event.r#final, None);
+
+    let final_event = tokio::time::timeout(Duration::from_secs(2), harness.events.recv())
+        .await
+        .expect("final subscription event timed out")
+        .expect("event channel closed");
+    assert_eq!(final_event.r#final, Some(true));
+
+    let result = next_result(&mut harness.results).await;
+    assert!(result.text.as_deref().unwrap().contains("streamed"));
+}
+
+#[tokio::test]
+async fn cancel_interrupts_a_streaming_command() {
+    let mut harness = harness().await;
+    harness.gateway.set_next_stdout("partial\n");
+    harness.gateway.set_exec_delay(Duration::from_millis(200));
+    let invocation = invocation(
+        "call-cancel",
+        "openshell_exec",
+        serde_json::json!({"command": ["sleep", "10"]}),
+    );
+    assert_eq!(invoke(&harness.app, &invocation).await, StatusCode::OK);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cancel_tool_call")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"thread_id":"thread-1","tool_call_id":"call-cancel"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let result = next_result(&mut harness.results).await;
+    assert!(
+        result.text.as_deref().unwrap().contains("cancelled"),
+        "result: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn output_is_capped_and_marked_truncated() {
+    let mut harness = harness().await;
+    harness.gateway.set_next_stdout(vec![b'x'; 2 * 1024 * 1024]);
+    let invocation = invocation(
+        "call-large",
+        "openshell_exec",
+        serde_json::json!({"command": ["cat", "large"]}),
+    );
+    assert_eq!(invoke(&harness.app, &invocation).await, StatusCode::OK);
+    let result = next_result(&mut harness.results).await;
+    let text = result.text.unwrap();
+    assert!(
+        text.len() <= 1024 * 1024 + 64,
+        "result length {}",
+        text.len()
+    );
+    assert!(text.contains("[truncated]"));
 }
 
 #[tokio::test]
