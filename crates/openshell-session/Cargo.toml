@@ -13,7 +13,7 @@ categories = ["development-tools", "api-bindings"]
 [features]
 default = ["openshell"]
 openshell = ["dep:openshell-sdk", "dep:openshell-policy", "dep:openshell-providers"]
-bootstrap = ["dep:openshell-bootstrap"]
+bootstrap = ["dep:openshell-bootstrap", "dep:openshell-sdk"]
 testkit = []
 
 [dependencies]

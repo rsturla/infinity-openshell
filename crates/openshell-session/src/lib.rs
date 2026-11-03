@@ -82,7 +82,9 @@ pub use providers::{ProviderAdmin, ProviderSpec};
 pub use runtime::{ReapReport, SessionRuntime};
 pub use session::Session;
 pub use snapshot::{SnapshotKey, SnapshotMeta, SnapshotPolicy, SnapshotStore};
-pub use token::{OidcCredentials, OidcRefreshToken, RefreshTokenStore, StaticToken, TokenSource};
+#[cfg(feature = "openshell")]
+pub use token::OidcRefreshToken;
+pub use token::{OidcCredentials, RefreshTokenStore, StaticToken, TokenSource};
 
 #[cfg(feature = "bootstrap")]
 pub use token::BootstrapTokenSource;

@@ -5,12 +5,15 @@
 //! identity provider will reject the old one.
 
 use std::fmt;
+#[cfg(any(feature = "openshell", feature = "bootstrap"))]
 use std::sync::Arc;
 #[cfg(feature = "bootstrap")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+#[cfg(any(feature = "openshell", feature = "bootstrap"))]
 use openshell_sdk::oidc::{RefreshTokenInput, refresh_token};
+#[cfg(any(feature = "openshell", feature = "bootstrap"))]
 use tokio::sync::Mutex;
 
 use crate::error::Error;
@@ -107,11 +110,13 @@ pub trait RefreshTokenStore: Send + Sync + 'static {
 }
 
 /// Refreshes an OIDC access token and persists the rotated refresh token.
+#[cfg(feature = "openshell")]
 pub struct OidcRefreshToken {
     credentials: Arc<Mutex<OidcCredentials>>,
     store: Option<Arc<dyn RefreshTokenStore>>,
 }
 
+#[cfg(feature = "openshell")]
 impl OidcRefreshToken {
     /// Construct a source from refresh credentials.
     pub fn new(credentials: OidcCredentials) -> Self {
@@ -128,6 +133,7 @@ impl OidcRefreshToken {
     }
 }
 
+#[cfg(feature = "openshell")]
 impl fmt::Debug for OidcRefreshToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -137,6 +143,7 @@ impl fmt::Debug for OidcRefreshToken {
     }
 }
 
+#[cfg(feature = "openshell")]
 #[async_trait]
 impl TokenSource for OidcRefreshToken {
     async fn token(&self) -> Result<String, Error> {
