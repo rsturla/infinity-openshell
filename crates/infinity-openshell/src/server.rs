@@ -44,6 +44,28 @@ struct AppState {
     thread_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
+/// Validate a server configuration and open its journal and callback client.
+///
+/// Use this as a preflight check before `serve`. It does not recover pending
+/// records or deliver callbacks.
+///
+/// # Errors
+///
+/// Returns a configuration, journal, or callback client error.
+pub async fn preflight(config: &ServerConfig) -> Result<(), Error> {
+    config.validate()?;
+    if config.journal_path.is_none() && !config.allow_ephemeral {
+        return Err(Error::InvalidConfig(
+            "journal_path is required; set allow_ephemeral for an in-memory journal".to_owned(),
+        ));
+    }
+    if let Some(path) = &config.journal_path {
+        FileJournal::open(path).await?;
+    }
+    build_callback(config).await?;
+    Ok(())
+}
+
 /// Build a RAP router with a plain callback client and a journal selected from
 /// [`ServerConfig::journal_path`].
 ///

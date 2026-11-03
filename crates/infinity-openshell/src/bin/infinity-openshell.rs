@@ -226,7 +226,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Check(args) => {
-            args.server_config()?;
+            let config = args.server_config()?;
+            infinity_openshell::preflight(&config).await?;
             let runtime = SessionRuntime::open(args.runtime_config()?).await?;
             drop(runtime);
             println!("ok");

@@ -53,7 +53,7 @@ pub use callback::{CallbackClient, CallbackError, PlainCallbackClient};
 pub use config::{CallbackAuth, InboundAuth, ServerConfig};
 pub use error::Error;
 pub use journal::{Accept, FileJournal, Journal, MemoryJournal, Pending, Recovered};
-pub use server::{router, router_with_callback};
+pub use server::{preflight, router, router_with_callback};
 pub use toolset::manifest;
 
 /// Apply the Infinity label policy to a session runtime configuration.
