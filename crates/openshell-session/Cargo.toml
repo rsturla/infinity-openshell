@@ -12,13 +12,16 @@ categories = ["development-tools", "api-bindings"]
 
 [features]
 default = ["openshell"]
-openshell = ["dep:openshell-sdk"]
+openshell = ["dep:openshell-sdk", "dep:openshell-policy", "dep:openshell-providers"]
 bootstrap = ["dep:openshell-bootstrap"]
 testkit = []
 
 [dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
+prost-types.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -26,6 +29,8 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 openshell-sdk = { workspace = true, optional = true }
+openshell-policy = { workspace = true, optional = true }
+openshell-providers = { workspace = true, optional = true }
 openshell-bootstrap = { workspace = true, optional = true }
 
 [dev-dependencies]

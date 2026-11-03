@@ -193,6 +193,19 @@ impl BootstrapTokenSource {
             bundle: Arc::new(Mutex::new(bundle)),
         })
     }
+
+    /// Return the registered gateway endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Gateway`] when the metadata cannot be read or parsed.
+    pub fn endpoint(&self) -> Result<url::Url, Error> {
+        let metadata = openshell_bootstrap::load_gateway_metadata(&self.gateway)
+            .map_err(|error| Error::Gateway(format!("cannot load gateway metadata: {error}")))?;
+        metadata.gateway_endpoint.parse().map_err(|error| {
+            Error::Gateway(format!("gateway endpoint is not a valid URL: {error}"))
+        })
+    }
 }
 
 #[cfg(feature = "bootstrap")]

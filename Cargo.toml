@@ -12,9 +12,16 @@ homepage = "https://github.com/rsturla/infinity-openshell"
 authors = ["Robert Sturla"]
 
 [workspace.dependencies]
+async-stream = "0.3"
 async-trait = "0.1"
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-credential-types = { version = "1", default-features = false }
+aws-sigv4 = { version = "1", default-features = false }
+aws-smithy-runtime-api = { version = "1", default-features = false }
 axum = "0.8"
 bytes = "1"
+futures-util = "0.3"
+prost-types = "0.14"
 rap-protocol = { git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
@@ -27,4 +34,6 @@ tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 openshell-sdk = { git = "https://github.com/NVIDIA/OpenShell", rev = "1afd9f69d118eefa6972c000830899f9c68d053a" }
+openshell-policy = { git = "https://github.com/NVIDIA/OpenShell", rev = "1afd9f69d118eefa6972c000830899f9c68d053a" }
+openshell-providers = { git = "https://github.com/NVIDIA/OpenShell", rev = "1afd9f69d118eefa6972c000830899f9c68d053a" }
 openshell-bootstrap = { git = "https://github.com/NVIDIA/OpenShell", rev = "1afd9f69d118eefa6972c000830899f9c68d053a" }

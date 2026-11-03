@@ -236,6 +236,8 @@ impl Actor {
                         .create(CreateSpec {
                             name: name.clone(),
                             template: self.config.template.default.clone(),
+                            image: self.config.image.clone(),
+                            providers: self.config.providers.clone(),
                             labels: self.labels(),
                             command: Vec::new(),
                         })
@@ -245,6 +247,11 @@ impl Actor {
                     self.gateway
                         .wait_ready(&name, self.config.lifecycle.ready_timeout)
                         .await?;
+                    if self.config.policy.is_some() || !self.config.providers.is_empty() {
+                        self.gateway
+                            .wait_policy(&name, self.config.lifecycle.ready_timeout)
+                            .await?;
+                    }
                 }
                 Phase::Stopped | Phase::Completed => {
                     self.gateway.start(&name).await?;

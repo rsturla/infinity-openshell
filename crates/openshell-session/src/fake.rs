@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::error::Error;
-use crate::gateway::{CreateSpec, ExecOutput, ExecRequest, Gateway, Phase, SandboxInfo};
+use crate::gateway::{CreateSpec, ExecEvent, ExecRequest, ExecStream, Gateway, Phase, SandboxInfo};
 use crate::ids::{SandboxName, SandboxPath};
 
 /// One sandbox in the fake gateway.
@@ -35,6 +35,7 @@ struct State {
     fail_next: Option<String>,
     next_stdout: Option<Bytes>,
     next_exit_code: Option<i32>,
+    exec_delay: Option<std::time::Duration>,
 }
 
 impl FakeGateway {
@@ -92,6 +93,14 @@ impl FakeGateway {
             .next_exit_code = Some(code);
     }
 
+    /// Delay each streamed event. Useful for streaming and cancellation tests.
+    pub fn set_exec_delay(&self, delay: std::time::Duration) {
+        self.state
+            .lock()
+            .expect("bug: fake state poisoned")
+            .exec_delay = Some(delay);
+    }
+
     /// Return the labels stored for a sandbox.
     pub fn labels(&self, name: &SandboxName) -> BTreeMap<String, String> {
         self.state
@@ -110,6 +119,17 @@ impl FakeGateway {
             .sandboxes
             .get(name.as_str())
             .map_or_else(BTreeMap::new, |sandbox| sandbox.files.clone())
+    }
+
+    /// Return every command executed in every sandbox.
+    pub fn all_execs(&self) -> Vec<ExecRequest> {
+        self.state
+            .lock()
+            .expect("bug: fake state poisoned")
+            .sandboxes
+            .values()
+            .flat_map(|sandbox| sandbox.execs.clone())
+            .collect()
     }
 
     /// Return the commands executed in a sandbox.
@@ -275,7 +295,11 @@ impl Gateway for FakeGateway {
         Ok(())
     }
 
-    async fn exec(&self, name: &SandboxName, request: ExecRequest) -> Result<ExecOutput, Error> {
+    async fn exec_stream(
+        &self,
+        name: &SandboxName,
+        request: ExecRequest,
+    ) -> Result<ExecStream, Error> {
         let mut state = self.state.lock().expect("bug: fake state poisoned");
         state.calls.push("exec".to_owned());
         Self::take_failure(&mut state, "exec")?;
@@ -284,17 +308,27 @@ impl Gateway for FakeGateway {
             .take()
             .unwrap_or_else(|| Bytes::from_static(b"ok\n"));
         let code = state.next_exit_code.take().unwrap_or(0);
+        let delay = state.exec_delay;
         let sandbox = state
             .sandboxes
             .get_mut(name.as_str())
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
         sandbox.execs.push(request);
-        Ok(ExecOutput {
-            code,
-            stdout,
-            stderr: Bytes::new(),
-            truncated: false,
-        })
+        let events = vec![
+            Ok(ExecEvent::Stdout(stdout)),
+            Ok(ExecEvent::Exited { code }),
+        ];
+        let stream = futures_util::stream::unfold(
+            (events.into_iter(), delay),
+            |(mut events, delay)| async move {
+                let event = events.next()?;
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                Some((event, (events, delay)))
+            },
+        );
+        Ok(Box::pin(stream))
     }
 
     async fn read_file(&self, name: &SandboxName, path: &SandboxPath) -> Result<Bytes, Error> {
@@ -317,6 +351,7 @@ impl Gateway for FakeGateway {
         name: &SandboxName,
         path: &SandboxPath,
         bytes: Bytes,
+        _request_id: Option<&str>,
     ) -> Result<(), Error> {
         let mut state = self.state.lock().expect("bug: fake state poisoned");
         state.calls.push("write_file".to_owned());

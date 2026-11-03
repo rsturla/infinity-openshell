@@ -26,6 +26,8 @@ pub enum ErrorKind {
     StaleSession,
     /// The gateway does not support the requested operation.
     Unsupported,
+    /// The execution outcome is unknown and must be reconciled.
+    Uncertain,
     /// The gateway returned an error.
     Gateway,
     /// An internal invariant was violated.
@@ -72,6 +74,11 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// The execution outcome is unknown. Do not retry a mutating operation
+    /// without reconciling its effects.
+    #[error("execution outcome is uncertain: {0}")]
+    Uncertain(String),
+
     /// The gateway returned an error.
     #[error("gateway error: {0}")]
     Gateway(String),
@@ -94,6 +101,7 @@ impl Error {
             Self::Cancelled => ErrorKind::Cancelled,
             Self::StaleSession => ErrorKind::StaleSession,
             Self::Unsupported(_) => ErrorKind::Unsupported,
+            Self::Uncertain(_) => ErrorKind::Uncertain,
             Self::Gateway(_) => ErrorKind::Gateway,
             Self::Internal(_) => ErrorKind::Internal,
         }

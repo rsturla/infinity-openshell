@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::StreamExt;
 
 use crate::error::Error;
 use crate::ids::{SandboxName, SandboxPath};
@@ -60,8 +61,12 @@ pub struct SandboxInfo {
 pub struct CreateSpec {
     /// Sandbox name.
     pub name: SandboxName,
-    /// Workload template. `None` uses the gateway default image.
+    /// Workload template. `None` uses `image` or the gateway default image.
     pub template: Option<String>,
+    /// Custom OCI image. `None` uses the gateway default image.
+    pub image: Option<String>,
+    /// Provider instances to attach at creation.
+    pub providers: Vec<String>,
     /// Labels.
     pub labels: BTreeMap<String, String>,
     /// Optional canonical command. Empty selects the image's default shell.
@@ -83,6 +88,11 @@ pub struct ExecRequest {
     pub timeout: Option<Duration>,
     /// Maximum bytes retained from stdout or stderr.
     pub max_output_bytes: usize,
+    /// Optional OpenShell durable-admission request ID.
+    ///
+    /// A nonzero UUID makes the gateway treat a retry with the same ID as the
+    /// same execution. The runtime derives one from the RAP call ID.
+    pub request_id: Option<String>,
 }
 
 impl ExecRequest {
@@ -95,9 +105,28 @@ impl ExecRequest {
             stdin: None,
             timeout: None,
             max_output_bytes: 1024 * 1024,
+            request_id: None,
         }
     }
 }
+
+/// One event from a streaming command.
+#[derive(Clone, Debug)]
+pub enum ExecEvent {
+    /// Standard output chunk.
+    Stdout(Bytes),
+    /// Standard error chunk.
+    Stderr(Bytes),
+    /// Process exit.
+    Exited {
+        /// Exit code.
+        code: i32,
+    },
+}
+
+/// A boxed stream of command events.
+pub type ExecStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<ExecEvent, Error>> + Send>>;
 
 /// Result of a command.
 #[derive(Clone, Debug)]
@@ -160,11 +189,53 @@ pub trait Gateway: Send + Sync + 'static {
     /// Wait until the sandbox is ready or completed.
     async fn wait_ready(&self, name: &SandboxName, timeout: Duration) -> Result<(), Error>;
 
+    /// Wait until the sandbox has loaded its policy.
+    ///
+    /// Sandboxes whose policy arrives at creation can become ready before the
+    /// supervisor applies it. The gateway implementation polls the policy
+    /// status; a gateway without policy support returns immediately.
+    async fn wait_policy(&self, _name: &SandboxName, _timeout: Duration) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Wait until the sandbox is gone.
     async fn wait_deleted(&self, name: &SandboxName, timeout: Duration) -> Result<(), Error>;
 
-    /// Execute a command.
-    async fn exec(&self, name: &SandboxName, request: ExecRequest) -> Result<ExecOutput, Error>;
+    /// Execute a command and stream its output.
+    async fn exec_stream(
+        &self,
+        name: &SandboxName,
+        request: ExecRequest,
+    ) -> Result<ExecStream, Error>;
+
+    /// Execute a command and buffer its output up to the request cap.
+    ///
+    /// This default implementation drains the stream but retains at most
+    /// `max_output_bytes` per channel, so a chatty command cannot exhaust
+    /// memory.
+    async fn exec(&self, name: &SandboxName, request: ExecRequest) -> Result<ExecOutput, Error> {
+        let cap = request.max_output_bytes;
+        let mut stream = self.exec_stream(name, request).await?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = None;
+        let mut truncated = false;
+
+        while let Some(event) = stream.next().await {
+            match event? {
+                ExecEvent::Stdout(chunk) => append_capped(&mut stdout, &chunk, cap, &mut truncated),
+                ExecEvent::Stderr(chunk) => append_capped(&mut stderr, &chunk, cap, &mut truncated),
+                ExecEvent::Exited { code } => exit_code = Some(code),
+            }
+        }
+
+        Ok(ExecOutput {
+            code: exit_code.unwrap_or(-1),
+            stdout: Bytes::from(stdout),
+            stderr: Bytes::from(stderr),
+            truncated,
+        })
+    }
 
     /// Read a file relative to the sandbox workspace.
     async fn read_file(&self, name: &SandboxName, path: &SandboxPath) -> Result<Bytes, Error>;
@@ -175,5 +246,20 @@ pub trait Gateway: Send + Sync + 'static {
         name: &SandboxName,
         path: &SandboxPath,
         bytes: Bytes,
+        request_id: Option<&str>,
     ) -> Result<(), Error>;
+}
+
+fn append_capped(target: &mut Vec<u8>, chunk: &[u8], cap: usize, truncated: &mut bool) {
+    if target.len() >= cap {
+        *truncated |= !chunk.is_empty();
+        return;
+    }
+    let remaining = cap - target.len();
+    if chunk.len() > remaining {
+        target.extend_from_slice(&chunk[..remaining]);
+        *truncated = true;
+    } else {
+        target.extend_from_slice(chunk);
+    }
 }

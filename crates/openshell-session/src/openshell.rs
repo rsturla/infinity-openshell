@@ -6,15 +6,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::StreamExt;
+use openshell_sdk::raw::proto;
+use openshell_sdk::raw::proto::ExecSandboxRequest;
 use openshell_sdk::{
-    AuthConfig, ClientConfig, ClientIdentity, DeleteOptions, ExecOptions, ListOptions,
-    OpenShellClient, ResumeOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    SandboxTemplateCreateSpec, SdkError,
+    AuthConfig, ClientConfig, ClientIdentity, DeleteOptions, ListOptions, OpenShellClient,
+    ResumeOptions, SandboxPhase, SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SdkError,
 };
 
 use crate::config::RuntimeConfig;
 use crate::error::Error;
-use crate::gateway::{CreateSpec, ExecOutput, ExecRequest, Gateway, Phase, SandboxInfo};
+use crate::gateway::{CreateSpec, ExecEvent, ExecRequest, ExecStream, Gateway, Phase, SandboxInfo};
 use crate::ids::{SandboxName, SandboxPath};
 
 /// OpenShell gateway client.
@@ -23,6 +25,7 @@ pub struct OpenShellGateway {
     client: OpenShellClient,
     workspace: String,
     workdir: String,
+    policy: Option<proto::SandboxPolicy>,
     exec_timeout: Duration,
     control_timeout: Duration,
     max_output_bytes: usize,
@@ -35,42 +38,20 @@ impl OpenShellGateway {
     ///
     /// Returns a configuration, transport, authentication, or health error.
     pub async fn connect(config: &RuntimeConfig) -> Result<Self, Error> {
-        let mut client_config = ClientConfig::new(config.gateway.endpoint.as_str());
-        match &config.gateway.auth {
-            crate::config::GatewayAuth::None => {}
-            crate::config::GatewayAuth::Oidc { token } => {
-                client_config.auth = Some(AuthConfig::oidc(token.clone()));
-            }
-            crate::config::GatewayAuth::OidcSource { source } => {
-                let token = source.token().await?;
-                client_config.auth = Some(AuthConfig::Oidc {
-                    token,
-                    expires_at: None,
-                    refresh: Some(Arc::new(SourceRefresh {
-                        source: source.clone(),
-                    })),
-                });
-            }
-            crate::config::GatewayAuth::Mtls { ca, cert, key } => {
-                client_config.ca_cert = Some(ca.clone());
-                client_config.client_identity =
-                    Some(ClientIdentity::new(cert.clone(), key.clone()));
-            }
-        }
-
-        let client = OpenShellClient::connect(client_config)
-            .await
-            .map_err(map_sdk)?;
-        let health = tokio::time::timeout(config.lifecycle.ready_timeout, client.health())
-            .await
-            .map_err(|_| Error::Timeout("gateway health check timed out".to_owned()))?
-            .map_err(map_sdk)?;
-        tracing::info!(version = %health.version, "connected to OpenShell gateway");
+        let client = connect_client(config).await?;
+        let policy =
+            match &config.policy {
+                Some(yaml) => Some(openshell_policy::parse_sandbox_policy(yaml).map_err(
+                    |error| Error::InvalidConfig(format!("invalid sandbox policy: {error}")),
+                )?),
+                None => None,
+            };
 
         Ok(Self {
             client,
             workspace: config.gateway.workspace.clone(),
             workdir: config.workdir.clone(),
+            policy,
             exec_timeout: config.lifecycle.exec_timeout,
             control_timeout: config.lifecycle.ready_timeout,
             max_output_bytes: config.lifecycle.max_output_bytes,
@@ -98,34 +79,98 @@ impl OpenShellGateway {
             .map_err(|_| Error::Timeout("gateway control request timed out".to_owned()))?
             .map_err(map)
     }
+
+    async fn create_raw(
+        &self,
+        name: SandboxName,
+        template_name: Option<String>,
+        image: Option<String>,
+        providers: Vec<String>,
+        labels: HashMap<String, String>,
+        command: Vec<String>,
+    ) -> Result<SandboxInfo, Error> {
+        let template = image.map(|image| proto::SandboxTemplate {
+            image,
+            ..proto::SandboxTemplate::default()
+        });
+        let request = proto::CreateSandboxRequest {
+            request_id: String::new(),
+            spec: Some(proto::SandboxSpec {
+                template,
+                providers,
+                policy: self.policy.clone(),
+                command,
+                ..proto::SandboxSpec::default()
+            }),
+            name: name.as_str().to_owned(),
+            labels,
+            annotations: HashMap::new(),
+            workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+            await_main_process_attachment: false,
+            workload_template: template_name.unwrap_or_default(),
+            service_exposures: Vec::new(),
+        };
+        let mut grpc = self.client.raw_grpc_fresh().await.map_err(map_sdk)?;
+        let response = self
+            .control_with(
+                async move {
+                    grpc.create_sandbox(request)
+                        .await
+                        .map_err(SdkError::from_status)
+                },
+                map_sdk,
+            )
+            .await?;
+        let sandbox = response.into_inner().sandbox.ok_or_else(|| {
+            Error::Gateway("gateway response did not include a sandbox".to_owned())
+        })?;
+        info_from_proto(sandbox)
+    }
 }
 
 #[async_trait]
 impl Gateway for OpenShellGateway {
     async fn create(&self, spec: CreateSpec) -> Result<SandboxInfo, Error> {
+        let CreateSpec {
+            name,
+            template,
+            image,
+            providers,
+            labels,
+            command,
+        } = spec;
         let workspace = self.workspace();
-        let labels: HashMap<String, String> = spec.labels.into_iter().collect();
-        let created = if let Some(template) = spec.template {
-            self.control(
-                workspace.create_sandbox_from_template(SandboxTemplateCreateSpec {
-                    name: Some(spec.name.as_str().to_owned()),
-                    template_name: template,
-                    labels,
-                    command: spec.command,
-                    ..Default::default()
-                }),
-            )
-            .await?
+        let labels: HashMap<String, String> = labels.into_iter().collect();
+        let created = if image.is_some() || self.policy.is_some() {
+            self.create_raw(name, template, image, providers, labels, command)
+                .await?
+        } else if let Some(template) = template {
+            info_from_ref(
+                self.control(
+                    workspace.create_sandbox_from_template(SandboxTemplateCreateSpec {
+                        name: Some(name.as_str().to_owned()),
+                        template_name: template,
+                        labels,
+                        providers,
+                        command,
+                        ..Default::default()
+                    }),
+                )
+                .await?,
+            )?
         } else {
-            self.control(workspace.create_sandbox(SandboxSpec {
-                name: Some(spec.name.as_str().to_owned()),
-                labels,
-                command: spec.command,
-                ..Default::default()
-            }))
-            .await?
+            info_from_ref(
+                self.control(workspace.create_sandbox(SandboxSpec {
+                    name: Some(name.as_str().to_owned()),
+                    labels,
+                    providers,
+                    command,
+                    ..Default::default()
+                }))
+                .await?,
+            )?
         };
-        info_from_ref(created)
+        Ok(created)
     }
 
     async fn get(&self, name: &SandboxName) -> Result<Option<SandboxInfo>, Error> {
@@ -215,6 +260,43 @@ impl Gateway for OpenShellGateway {
         .map_err(map_sdk)
     }
 
+    async fn wait_policy(&self, name: &SandboxName, timeout: Duration) -> Result<(), Error> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut grpc = self.client.raw_grpc_fresh().await.map_err(map_sdk)?;
+            let response = grpc
+                .get_sandbox_policy_status(proto::GetSandboxPolicyStatusRequest {
+                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    version: 0,
+                    global: false,
+                    sandbox: name.as_str().to_owned(),
+                })
+                .await
+                .map_err(|status| map_sdk(SdkError::from_status(status)))?
+                .into_inner();
+            match response.revision {
+                Some(revision) => match proto::PolicyStatus::try_from(revision.status) {
+                    Ok(proto::PolicyStatus::Loaded) => return Ok(()),
+                    Ok(proto::PolicyStatus::Failed) => {
+                        return Err(Error::InvalidConfig(format!(
+                            "sandbox policy failed to load: {}",
+                            revision.load_error
+                        )));
+                    }
+                    _ => {}
+                },
+                None if response.active_version > 0 => return Ok(()),
+                None => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Timeout(
+                    "sandbox policy did not load before the deadline".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     async fn wait_deleted(&self, name: &SandboxName, timeout: Duration) -> Result<(), Error> {
         match tokio::time::timeout(
             timeout + Duration::from_secs(5),
@@ -228,41 +310,62 @@ impl Gateway for OpenShellGateway {
         }
     }
 
-    async fn exec(&self, name: &SandboxName, request: ExecRequest) -> Result<ExecOutput, Error> {
-        let cap = if request.max_output_bytes == 0 {
-            self.max_output_bytes
-        } else {
-            request.max_output_bytes.min(self.max_output_bytes)
+    async fn exec_stream(
+        &self,
+        name: &SandboxName,
+        request: ExecRequest,
+    ) -> Result<ExecStream, Error> {
+        let timeout = request
+            .timeout
+            .or(Some(self.exec_timeout))
+            .unwrap_or_default();
+        let execution_timeout = prost_types::Duration {
+            seconds: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+            nanos: timeout.subsec_nanos() as i32,
         };
-        let result = self
-            .workspace()
-            .exec(
-                name.as_str(),
-                &request.argv,
-                ExecOptions {
-                    workdir: Some(request.workdir.unwrap_or_else(|| self.workdir.clone())),
-                    environment: request.env.into_iter().collect(),
-                    timeout: request.timeout.or(Some(self.exec_timeout)),
-                    stdin: request.stdin.map(|bytes| bytes.to_vec()),
-                    no_login_shell: true,
-                },
-            )
+
+        let mut grpc = self.client.raw_grpc_fresh().await.map_err(map_exec_sdk)?;
+        let response = grpc
+            .exec_sandbox(ExecSandboxRequest {
+                workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                sandbox: name.as_str().to_owned(),
+                command: request.argv,
+                workdir: request.workdir.unwrap_or_else(|| self.workdir.clone()),
+                environment: request.env.into_iter().collect(),
+                execution_timeout: Some(execution_timeout),
+                stdin: request
+                    .stdin
+                    .map(|bytes| bytes.to_vec())
+                    .unwrap_or_default(),
+                tty: false,
+                cols: 0,
+                rows: 0,
+                no_login_shell: true,
+                request_id: request.request_id.unwrap_or_default(),
+            })
             .await
-            .map_err(map_exec_sdk)?;
+            .map_err(|status| map_exec_sdk(SdkError::from_status(status)))?;
 
-        let stdout_truncated = result.stdout.len() > cap;
-        let stderr_truncated = result.stderr.len() > cap;
-        let mut stdout = result.stdout;
-        let mut stderr = result.stderr;
-        stdout.truncate(cap);
-        stderr.truncate(cap);
-
-        Ok(ExecOutput {
-            code: result.exit_code,
-            stdout: Bytes::from(stdout),
-            stderr: Bytes::from(stderr),
-            truncated: stdout_truncated || stderr_truncated,
-        })
+        let stream = response.into_inner().filter_map(|item| async move {
+            match item {
+                Err(status) => Some(Err(map_exec_sdk(SdkError::from_status(status)))),
+                Ok(event) => match event.payload {
+                    Some(proto::exec_sandbox_event::Payload::Stdout(chunk)) => {
+                        Some(Ok(ExecEvent::Stdout(Bytes::from(chunk.data))))
+                    }
+                    Some(proto::exec_sandbox_event::Payload::Stderr(chunk)) => {
+                        Some(Ok(ExecEvent::Stderr(Bytes::from(chunk.data))))
+                    }
+                    Some(proto::exec_sandbox_event::Payload::Exit(exit)) => {
+                        Some(Ok(ExecEvent::Exited {
+                            code: exit.exit_code,
+                        }))
+                    }
+                    None => None,
+                },
+            }
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn read_file(&self, name: &SandboxName, path: &SandboxPath) -> Result<Bytes, Error> {
@@ -282,6 +385,7 @@ impl Gateway for OpenShellGateway {
                     stdin: None,
                     timeout: Some(self.exec_timeout),
                     max_output_bytes: self.max_output_bytes,
+                    request_id: None,
                 },
             )
             .await?;
@@ -305,6 +409,7 @@ impl Gateway for OpenShellGateway {
         name: &SandboxName,
         path: &SandboxPath,
         bytes: Bytes,
+        request_id: Option<&str>,
     ) -> Result<(), Error> {
         let output = self
             .exec(
@@ -322,6 +427,7 @@ impl Gateway for OpenShellGateway {
                     stdin: Some(bytes),
                     timeout: Some(self.exec_timeout),
                     max_output_bytes: self.max_output_bytes,
+                    request_id: request_id.map(str::to_owned),
                 },
             )
             .await?;
@@ -331,6 +437,40 @@ impl Gateway for OpenShellGateway {
         }
         Ok(())
     }
+}
+
+pub(crate) async fn connect_client(config: &RuntimeConfig) -> Result<OpenShellClient, Error> {
+    let mut client_config = ClientConfig::new(config.gateway.endpoint.as_str());
+    match &config.gateway.auth {
+        crate::config::GatewayAuth::None => {}
+        crate::config::GatewayAuth::Oidc { token } => {
+            client_config.auth = Some(AuthConfig::oidc(token.clone()));
+        }
+        crate::config::GatewayAuth::OidcSource { source } => {
+            let token = source.token().await?;
+            client_config.auth = Some(AuthConfig::Oidc {
+                token,
+                expires_at: None,
+                refresh: Some(Arc::new(SourceRefresh {
+                    source: source.clone(),
+                })),
+            });
+        }
+        crate::config::GatewayAuth::Mtls { ca, cert, key } => {
+            client_config.ca_cert = Some(ca.clone());
+            client_config.client_identity = Some(ClientIdentity::new(cert.clone(), key.clone()));
+        }
+    }
+
+    let client = OpenShellClient::connect(client_config)
+        .await
+        .map_err(map_sdk)?;
+    let health = tokio::time::timeout(config.lifecycle.ready_timeout, client.health())
+        .await
+        .map_err(|_| Error::Timeout("gateway health check timed out".to_owned()))?
+        .map_err(map_sdk)?;
+    tracing::info!(version = %health.version, "connected to OpenShell gateway");
+    Ok(client)
 }
 
 struct SourceRefresh {
@@ -360,6 +500,40 @@ fn info_from_ref(sandbox: SandboxRef) -> Result<SandboxInfo, Error> {
     })
 }
 
+fn info_from_proto(sandbox: proto::Sandbox) -> Result<SandboxInfo, Error> {
+    let metadata = sandbox.metadata.unwrap_or_default();
+    let status = sandbox.status.unwrap_or_default();
+    let name =
+        SandboxName::new(metadata.name).map_err(|error| Error::Gateway(error.to_string()))?;
+    let phase =
+        proto::SandboxPhase::try_from(status.phase).map_or(Phase::Unknown, |phase| match phase {
+            proto::SandboxPhase::Unspecified | proto::SandboxPhase::Unknown => Phase::Unknown,
+            proto::SandboxPhase::Provisioning => Phase::Provisioning,
+            proto::SandboxPhase::Ready => Phase::Ready,
+            proto::SandboxPhase::Error => Phase::Error,
+            proto::SandboxPhase::Deleting => Phase::Deleting,
+            proto::SandboxPhase::Stopping | proto::SandboxPhase::Suspending => Phase::Stopping,
+            proto::SandboxPhase::Stopped => Phase::Stopped,
+            proto::SandboxPhase::Starting => Phase::Starting,
+            proto::SandboxPhase::Completed => Phase::Completed,
+            proto::SandboxPhase::Suspended => Phase::Suspended,
+        });
+    Ok(SandboxInfo {
+        name,
+        phase,
+        labels: metadata.labels.into_iter().collect(),
+        created_at_ms: status.main_process_started_time.and_then(timestamp_millis),
+        exit_code: status.exit_code,
+    })
+}
+
+fn timestamp_millis(timestamp: prost_types::Timestamp) -> Option<i64> {
+    timestamp
+        .seconds
+        .checked_mul(1000)?
+        .checked_add(i64::from(timestamp.nanos / 1_000_000))
+}
+
 fn map_phase(phase: SandboxPhase) -> Phase {
     match phase {
         SandboxPhase::Unspecified => Phase::Unknown,
@@ -379,6 +553,20 @@ fn map_phase(phase: SandboxPhase) -> Phase {
 }
 
 fn map_exec_sdk(error: SdkError) -> Error {
+    let reason = error
+        .error_details()
+        .and_then(|details| details.error_info().map(|info| info.reason.clone()));
+    let uncertain = reason.is_some_and(|reason| {
+        matches!(
+            reason.as_str(),
+            "REQUEST_OUTCOME_UNCERTAIN"
+                | "REQUEST_STREAM_UNAVAILABLE"
+                | "REQUEST_ID_PAYLOAD_MISMATCH"
+        )
+    });
+    if uncertain {
+        return Error::Uncertain(error.to_string());
+    }
     match error {
         SdkError::InvalidConfig { message, .. } => Error::InvalidInput(message),
         other => map_sdk(other),
@@ -396,7 +584,7 @@ fn map_control_sdk(error: SdkError) -> Error {
     }
 }
 
-fn map_sdk(error: SdkError) -> Error {
+pub(crate) fn map_sdk(error: SdkError) -> Error {
     match error {
         SdkError::NotFound { message, .. } => Error::NotFound(message),
         SdkError::AlreadyExists { message, .. } => Error::Conflict(message),

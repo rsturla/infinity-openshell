@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 
 use crate::actor::Lease;
 use crate::error::Error;
-use crate::gateway::{ExecOutput, ExecRequest, Gateway};
+use crate::gateway::{ExecOutput, ExecRequest, ExecStream, Gateway};
 use crate::ids::{Generation, SandboxName, SandboxPath};
 
 /// A lease on a ready sandbox.
@@ -20,12 +21,15 @@ use crate::ids::{Generation, SandboxName, SandboxPath};
 /// concurrent work on the same thread.
 pub struct Session {
     gateway: Arc<dyn Gateway>,
-    lease: Lease,
+    lease: Arc<Lease>,
 }
 
 impl Session {
     pub(crate) fn new(gateway: Arc<dyn Gateway>, lease: Lease) -> Self {
-        Self { gateway, lease }
+        Self {
+            gateway,
+            lease: Arc::new(lease),
+        }
     }
 
     /// Return the sandbox name.
@@ -36,6 +40,11 @@ impl Session {
     /// Return the sandbox generation.
     pub fn generation(&self) -> Generation {
         self.lease.generation
+    }
+
+    /// Return the maximum bytes retained per output channel.
+    pub fn max_output_bytes(&self) -> usize {
+        self.lease.max_output_bytes
     }
 
     /// Execute a command in the sandbox.
@@ -51,7 +60,62 @@ impl Session {
     /// gateway error for execution failures.
     pub async fn exec(&self, request: ExecRequest) -> Result<ExecOutput, Error> {
         self.ensure_alive()?;
-        let mut request = request;
+        let request = self.prepare(request)?;
+        let _permit = self
+            .lease
+            .exec_permits
+            .acquire()
+            .await
+            .map_err(|_| Error::Internal("exec semaphore closed".to_owned()))?;
+
+        self.gateway
+            .exec(&self.lease.name, request)
+            .await
+            .map_err(|error| match error {
+                Error::NotFound(_) => Error::StaleSession,
+                other => other,
+            })
+    }
+
+    /// Execute a command and stream its output.
+    ///
+    /// The semaphore permit is held for the life of the stream, so
+    /// `max_concurrent_execs` also bounds streaming commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StaleSession`] when the sandbox is no longer current,
+    /// or a gateway error when execution cannot start.
+    pub async fn exec_stream(&self, request: ExecRequest) -> Result<ExecStream, Error> {
+        self.ensure_alive()?;
+        let request = self.prepare(request)?;
+        let permit = self
+            .lease
+            .exec_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Internal("exec semaphore closed".to_owned()))?;
+        let lease = Arc::clone(&self.lease);
+        let mut stream = self
+            .gateway
+            .exec_stream(&self.lease.name, request)
+            .await
+            .map_err(|error| match error {
+                Error::NotFound(_) => Error::StaleSession,
+                other => other,
+            })?;
+        let output = async_stream::try_stream! {
+            let _permit = permit;
+            let _lease = lease;
+            while let Some(event) = stream.next().await {
+                yield event?;
+            }
+        };
+        Ok(Box::pin(output))
+    }
+
+    fn prepare(&self, mut request: ExecRequest) -> Result<ExecRequest, Error> {
         request.max_output_bytes = if request.max_output_bytes == 0 {
             self.lease.max_output_bytes
         } else {
@@ -71,21 +135,7 @@ impl Session {
             ));
         }
         validate_exec(&request)?;
-
-        let _permit = self
-            .lease
-            .exec_permits
-            .acquire()
-            .await
-            .map_err(|_| Error::Internal("exec semaphore closed".to_owned()))?;
-
-        self.gateway
-            .exec(&self.lease.name, request)
-            .await
-            .map_err(|error| match error {
-                Error::NotFound(_) => Error::StaleSession,
-                other => other,
-            })
+        Ok(request)
     }
 
     /// Read a file relative to the sandbox workspace.
@@ -109,6 +159,24 @@ impl Session {
         path: &SandboxPath,
         bytes: impl Into<Bytes>,
     ) -> Result<(), Error> {
+        self.write_file_with_request_id(path, bytes, None).await
+    }
+
+    /// Write a file with an optional OpenShell durable-admission request ID.
+    ///
+    /// Use a stable ID for a retried mutating write. The gateway then treats a
+    /// second attempt with the same ID as the same execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StaleSession`] when the sandbox is no longer current,
+    /// or [`Error::InvalidInput`] when the payload exceeds the runtime limit.
+    pub async fn write_file_with_request_id(
+        &self,
+        path: &SandboxPath,
+        bytes: impl Into<Bytes>,
+        request_id: Option<&str>,
+    ) -> Result<(), Error> {
         self.ensure_alive()?;
         let bytes = bytes.into();
         if bytes.len() > self.lease.max_input_bytes {
@@ -116,7 +184,9 @@ impl Session {
                 "file write exceeds max_input_bytes".to_owned(),
             ));
         }
-        self.gateway.write_file(&self.lease.name, path, bytes).await
+        self.gateway
+            .write_file(&self.lease.name, path, bytes, request_id)
+            .await
     }
 
     fn ensure_alive(&self) -> Result<(), Error> {

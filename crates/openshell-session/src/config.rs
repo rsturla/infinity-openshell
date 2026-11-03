@@ -186,6 +186,25 @@ pub struct RuntimeConfig {
     pub gateway: GatewayConfig,
     /// Allowed workload templates.
     pub template: TemplatePolicy,
+    /// Custom OCI image for new sandboxes.
+    ///
+    /// Mutually exclusive with [`TemplatePolicy::default`]. The image must be
+    /// visible to the gateway's compute driver and must contain the tools the
+    /// agent runs. OpenShell uses the image's `WORKDIR` as the workspace, so
+    /// [`RuntimeConfig::workdir`] must name a writable directory in the image.
+    pub image: Option<String>,
+    /// Provider instances attached to every sandbox this runtime creates.
+    ///
+    /// Create the instances first with `openshell provider create`. Each
+    /// attached provider whose profile declares endpoints contributes that
+    /// profile's network rules to the sandbox effective policy.
+    pub providers: Vec<String>,
+    /// Create-time sandbox policy in OpenShell YAML form.
+    ///
+    /// The policy authorizes network traffic and filesystem access. `None`
+    /// uses the gateway default, which denies all outbound network access
+    /// unless an attached provider contributes rules.
+    pub policy: Option<String>,
     /// Lifecycle and execution limits.
     pub lifecycle: LifecyclePolicy,
     /// Process-wide limits.
@@ -209,6 +228,9 @@ impl RuntimeConfig {
         Self {
             gateway,
             template: TemplatePolicy::default(),
+            image: None,
+            providers: Vec::new(),
+            policy: None,
             lifecycle: LifecyclePolicy::default(),
             limits: Limits::default(),
             managed_by: "openshell-session".to_owned(),
@@ -293,6 +315,29 @@ impl RuntimeConfig {
                 "template '{default}' is not in the allowlist"
             )));
         }
+        if let Some(image) = &self.image {
+            if image.trim().is_empty() {
+                return Err(Error::InvalidConfig("image must not be empty".to_owned()));
+            }
+            if self.template.default.is_some() {
+                return Err(Error::InvalidConfig(
+                    "image and template.default are mutually exclusive".to_owned(),
+                ));
+            }
+        }
+        for provider in &self.providers {
+            if provider.trim().is_empty() {
+                return Err(Error::InvalidConfig(
+                    "provider names must not be empty".to_owned(),
+                ));
+            }
+        }
+        #[cfg(feature = "openshell")]
+        if let Some(policy) = &self.policy {
+            openshell_policy::parse_sandbox_policy(policy).map_err(|error| {
+                Error::InvalidConfig(format!("invalid sandbox policy: {error}"))
+            })?;
+        }
         if self.managed_by.trim().is_empty()
             || self.managed_by.len() > 63
             || self.managed_by.chars().any(char::is_control)
@@ -329,6 +374,34 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         RuntimeConfig::new(gateway()).validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_an_image_with_a_template() {
+        let mut config = RuntimeConfig::new(gateway());
+        config.image = Some("registry.example.com/agent:1".to_owned());
+        config.validate().unwrap();
+        config.template = TemplatePolicy::named("agent");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_an_empty_provider_name() {
+        let mut config = RuntimeConfig::new(gateway());
+        config.providers = vec![String::new()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_policy_yaml() {
+        let mut config = RuntimeConfig::new(gateway());
+        config.policy = Some("version: 1\nnetwork_policies: [".to_owned());
+        assert!(config.validate().is_err());
+        config.policy = Some(
+            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: example.com\n        port: 443\n    binaries:\n      - path: /usr/bin/curl\n"
+                .to_owned(),
+        );
+        config.validate().unwrap();
     }
 
     #[test]
