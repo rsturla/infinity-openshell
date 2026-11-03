@@ -63,6 +63,7 @@ mod ids;
 mod openshell;
 mod runtime;
 mod session;
+mod token;
 
 pub use config::{
     GatewayAuth, GatewayConfig, LifecyclePolicy, Limits, RuntimeConfig, TemplatePolicy,
@@ -73,6 +74,10 @@ pub use gateway::{CreateSpec, ExecOutput, ExecRequest, Gateway, Phase, SandboxIn
 pub use ids::{Generation, SandboxName, SandboxPath, SessionKey, TenantId, ThreadId};
 pub use runtime::{ReapReport, SessionRuntime};
 pub use session::Session;
+pub use token::{OidcCredentials, OidcRefreshToken, RefreshTokenStore, StaticToken, TokenSource};
+
+#[cfg(feature = "bootstrap")]
+pub use token::BootstrapTokenSource;
 
 #[cfg(feature = "openshell")]
 pub use openshell::OpenShellGateway;

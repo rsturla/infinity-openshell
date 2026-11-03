@@ -2,11 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use url::Url;
 
 use crate::error::Error;
+use crate::token::TokenSource;
 
 /// How a session releases compute when it goes idle.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -27,7 +29,7 @@ pub enum WakeStrategy {
 /// Gateway authentication.
 ///
 /// `Debug` never prints token or certificate material.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum GatewayAuth {
     /// Plaintext or anonymous TLS. Only for trusted development gateways.
@@ -36,6 +38,12 @@ pub enum GatewayAuth {
     Oidc {
         /// Access token.
         token: String,
+    },
+    /// OIDC bearer token from a refreshable source.
+    OidcSource {
+        /// Token source. The SDK refreshes it when the gateway rejects the
+        /// current token.
+        source: Arc<dyn TokenSource>,
     },
     /// Mutual TLS with PEM-encoded material.
     Mtls {
@@ -55,6 +63,10 @@ impl fmt::Debug for GatewayAuth {
             Self::Oidc { .. } => formatter
                 .debug_struct("Oidc")
                 .field("token", &"<redacted>")
+                .finish(),
+            Self::OidcSource { .. } => formatter
+                .debug_struct("OidcSource")
+                .field("source", &"<redacted>")
                 .finish(),
             Self::Mtls { .. } => formatter
                 .debug_struct("Mtls")
@@ -178,7 +190,14 @@ pub struct RuntimeConfig {
     pub lifecycle: LifecyclePolicy,
     /// Process-wide limits.
     pub limits: Limits,
-    /// Labels added to every sandbox this runtime creates.
+    /// Value for the `app.kubernetes.io/managed-by` label.
+    pub managed_by: String,
+    /// Prefix for the runtime, key, tenant, thread, and generation labels.
+    ///
+    /// The core defaults to `openshell-session`. A product layer can set its
+    /// own prefix; the Infinity RAP adapter uses `infinity.hydro.run`.
+    pub label_prefix: String,
+    /// Additional labels added to every sandbox this runtime creates.
     pub labels: BTreeMap<String, String>,
     /// Working directory inside the sandbox.
     pub workdir: String,
@@ -192,6 +211,8 @@ impl RuntimeConfig {
             template: TemplatePolicy::default(),
             lifecycle: LifecyclePolicy::default(),
             limits: Limits::default(),
+            managed_by: "openshell-session".to_owned(),
+            label_prefix: "openshell-session".to_owned(),
             labels: BTreeMap::new(),
             workdir: "/sandbox".to_owned(),
         }
@@ -271,6 +292,23 @@ impl RuntimeConfig {
             return Err(Error::InvalidConfig(format!(
                 "template '{default}' is not in the allowlist"
             )));
+        }
+        if self.managed_by.trim().is_empty()
+            || self.managed_by.len() > 63
+            || self.managed_by.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidConfig(
+                "managed_by must be 1 to 63 bytes without control characters".to_owned(),
+            ));
+        }
+        if self.label_prefix.trim().is_empty()
+            || self.label_prefix.len() > 253
+            || self.label_prefix.contains('/')
+            || self.label_prefix.chars().any(char::is_whitespace)
+        {
+            return Err(Error::InvalidConfig(
+                "label_prefix must be a DNS subdomain without whitespace or '/'".to_owned(),
+            ));
         }
         Ok(())
     }

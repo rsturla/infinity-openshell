@@ -7,40 +7,21 @@
 //! ```
 #![cfg(feature = "bootstrap")]
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openshell_sdk::oidc::{RefreshTokenInput, refresh_token};
 use openshell_session::{
-    ExecRequest, GatewayAuth, GatewayConfig, RuntimeConfig, SandboxPath, SessionKey,
-    SessionRuntime, TenantId, ThreadId,
+    BootstrapTokenSource, ExecRequest, GatewayAuth, GatewayConfig, RuntimeConfig, SandboxPath,
+    SessionKey, SessionRuntime, TenantId, ThreadId,
 };
 
-async fn fresh_token(gateway_name: &str) -> String {
-    let mut bundle =
-        openshell_bootstrap::oidc_token::load_oidc_token(gateway_name).unwrap_or_else(|| {
-            panic!("no OIDC token for '{gateway_name}'; run `openshell gateway login`")
-        });
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    if bundle.expires_at.is_some_and(|expires| expires <= now + 60) {
-        let refresh = bundle
-            .refresh_token
-            .as_deref()
-            .expect("expired token has no refresh token");
-        let input = RefreshTokenInput::new(refresh, &bundle.issuer, &bundle.client_id);
-        let refreshed = refresh_token(&input).await.expect("refresh OIDC token");
-        bundle.access_token = refreshed.access_token;
-    }
-    bundle.access_token
-}
-
-async fn live_config(gateway_name: &str) -> RuntimeConfig {
+fn live_config(gateway_name: &str) -> RuntimeConfig {
     let metadata =
         openshell_bootstrap::load_gateway_metadata(gateway_name).unwrap_or_else(|error| {
             panic!("cannot load gateway metadata for '{gateway_name}': {error}")
         });
-    let token = fresh_token(gateway_name).await;
+    let source =
+        Arc::new(BootstrapTokenSource::new(gateway_name).expect("load the cached OIDC token"));
 
     let endpoint = metadata
         .gateway_endpoint
@@ -49,7 +30,7 @@ async fn live_config(gateway_name: &str) -> RuntimeConfig {
     let mut config = RuntimeConfig::new(GatewayConfig::new(
         endpoint,
         "default",
-        GatewayAuth::Oidc { token },
+        GatewayAuth::OidcSource { source },
     ));
     config.workdir = "/sandbox".to_owned();
     config.lifecycle.idle_after = Duration::from_secs(1);
@@ -71,7 +52,7 @@ fn unique_thread() -> String {
 async fn live_stop_start_preserves_the_workspace() {
     let gateway_name =
         std::env::var("OPENSHELL_TEST_GATEWAY").unwrap_or_else(|_| "demo".to_owned());
-    let runtime = SessionRuntime::open(live_config(&gateway_name).await)
+    let runtime = SessionRuntime::open(live_config(&gateway_name))
         .await
         .expect("connect to the gateway");
 

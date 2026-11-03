@@ -173,6 +173,12 @@ infinity.hydro.run/owner    = <replica-id>   (HA)
 
 Raw tenant and thread IDs do not go into labels. The journal keeps the mapping.
 
+These are the Infinity deployment labels. `openshell-session` is
+product-neutral: it defaults to `managed-by=openshell-session` and an
+`openshell-session/*` label prefix. The `infinity-openshell` crate applies the
+Infinity policy with `configure_labels`, and CI checks that the core has no
+Infinity crate dependency.
+
 ### 3.2 Desired and observed state
 
 ```rust

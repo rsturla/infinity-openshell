@@ -1,0 +1,38 @@
+[package]
+name = "infinity-openshell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "RAP tool server that runs Infinity agent tools in OpenShell sandboxes"
+keywords = ["infinity", "openshell", "rap", "agents", "sandbox"]
+categories = ["development-tools", "api-bindings"]
+
+[features]
+default = []
+bootstrap = ["openshell-session/bootstrap"]
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+openshell-session = { path = "../openshell-session" }
+rap-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+openshell-bootstrap.workspace = true
+openshell-session = { path = "../openshell-session", features = ["testkit", "bootstrap"] }
+rap-client = { git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b" }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }

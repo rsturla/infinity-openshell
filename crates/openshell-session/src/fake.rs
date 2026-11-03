@@ -92,6 +92,16 @@ impl FakeGateway {
             .next_exit_code = Some(code);
     }
 
+    /// Return the labels stored for a sandbox.
+    pub fn labels(&self, name: &SandboxName) -> BTreeMap<String, String> {
+        self.state
+            .lock()
+            .expect("bug: fake state poisoned")
+            .sandboxes
+            .get(name.as_str())
+            .map_or_else(BTreeMap::new, |sandbox| sandbox.info.labels.clone())
+    }
+
     /// Return the files stored for a sandbox.
     pub fn files(&self, name: &SandboxName) -> BTreeMap<String, Bytes> {
         self.state

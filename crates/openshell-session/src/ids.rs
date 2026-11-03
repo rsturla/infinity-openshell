@@ -363,10 +363,10 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_names() {
-        assert!(SandboxName::new("Infinity-1").is_err());
-        assert!(SandboxName::new("-infinity").is_err());
-        assert!(SandboxName::new("infinity_1").is_err());
-        assert!(SandboxName::new("infinity-1").is_ok());
+        assert!(SandboxName::new("Sandbox-1").is_err());
+        assert!(SandboxName::new("-sandbox").is_err());
+        assert!(SandboxName::new("sandbox_1").is_err());
+        assert!(SandboxName::new("sandbox-1").is_ok());
     }
 
     #[test]

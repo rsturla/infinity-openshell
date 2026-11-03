@@ -318,6 +318,13 @@ mod tests {
         let session = runtime.acquire(key.clone()).await.unwrap();
         let name = session.name().clone();
         assert_eq!(count(&gateway, "create"), 1);
+        assert_eq!(
+            gateway
+                .labels(&name)
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
+            Some("openshell-session")
+        );
         drop(session);
         settle().await;
 
@@ -545,6 +552,37 @@ mod tests {
         settle().await;
         let report = runtime.reap().await.unwrap();
         assert_eq!(report.deleted, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_custom_label_policy_is_used_and_adopted() {
+        let gateway = Arc::new(FakeGateway::new());
+        let mut config = config();
+        config.managed_by = "acme-runtime".to_owned();
+        config.label_prefix = "acme.test".to_owned();
+        let key = key();
+
+        let runtime = SessionRuntime::new(gateway.clone(), config.clone()).unwrap();
+        let session = runtime.acquire(key.clone()).await.unwrap();
+        let name = session.name().clone();
+        let labels = gateway.labels(&name);
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
+            Some("acme-runtime")
+        );
+        assert!(labels.contains_key("acme.test/key"));
+        assert!(labels.contains_key("acme.test/gen"));
+        drop(session);
+        drop(runtime);
+
+        let runtime = SessionRuntime::new(gateway.clone(), config).unwrap();
+        let session = runtime.acquire(key.clone()).await.unwrap();
+        assert_eq!(session.name(), &name);
+        assert_eq!(count(&gateway, "create"), 1);
+        drop(session);
+        runtime.close(&key).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

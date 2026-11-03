@@ -1,6 +1,7 @@
 //! OpenShell SDK implementation of [`Gateway`].
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -39,6 +40,16 @@ impl OpenShellGateway {
             crate::config::GatewayAuth::None => {}
             crate::config::GatewayAuth::Oidc { token } => {
                 client_config.auth = Some(AuthConfig::oidc(token.clone()));
+            }
+            crate::config::GatewayAuth::OidcSource { source } => {
+                let token = source.token().await?;
+                client_config.auth = Some(AuthConfig::Oidc {
+                    token,
+                    expires_at: None,
+                    refresh: Some(Arc::new(SourceRefresh {
+                        source: source.clone(),
+                    })),
+                });
             }
             crate::config::GatewayAuth::Mtls { ca, cert, key } => {
                 client_config.ca_cert = Some(ca.clone());
@@ -319,6 +330,22 @@ impl Gateway for OpenShellGateway {
             return Err(Error::Gateway(format!("write failed: {stderr}")));
         }
         Ok(())
+    }
+}
+
+struct SourceRefresh {
+    source: Arc<dyn crate::token::TokenSource>,
+}
+
+#[async_trait]
+impl openshell_sdk::Refresh for SourceRefresh {
+    async fn refresh(&self) -> Result<openshell_sdk::RefreshedToken, openshell_sdk::RefreshError> {
+        let token = self
+            .source
+            .token()
+            .await
+            .map_err(|error| openshell_sdk::RefreshError::Transient(error.to_string()))?;
+        Ok(openshell_sdk::RefreshedToken::new(token))
     }
 }
 

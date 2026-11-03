@@ -13,17 +13,16 @@ Infinity and mount the OpenShell tool server into that process.
 
 ## Status
 
-Early implementation. `openshell-session` is implemented; the RAP adapter and
-testkit are next. The design is in
-[`docs/production-design.md`](docs/production-design.md).
+Early implementation. `openshell-session` and `infinity-openshell` are
+implemented. A separate testkit crate and an operational binary are next. The
+design is in [`docs/production-design.md`](docs/production-design.md).
 
 ## Crates
 
 | Crate | Role |
 |---|---|
-| `openshell-session` | Lease-managed OpenShell sandbox sessions |
-| `infinity-openshell` | RAP tool server adapter (not implemented yet) |
-| `infinity-openshell-testkit` | Fake gateway and deterministic test helpers (not implemented yet) |
+| `openshell-session` | Lease-managed OpenShell sandbox sessions; the fake gateway lives here behind the `testkit` feature |
+| `infinity-openshell` | RAP tool server: discovery, invoke, journal, callback outbox, core tools |
 
 ## Build
 

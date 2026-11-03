@@ -540,12 +540,13 @@ impl Actor {
         let mut labels = self.key_labels();
         labels.insert(
             "app.kubernetes.io/managed-by".to_owned(),
-            "infinity-openshell".to_owned(),
+            self.config.managed_by.clone(),
         );
         let mut sandboxes = self.gateway.list_managed(&labels).await?;
         sandboxes.sort_by_key(|info| info.created_at_ms.unwrap_or(0));
+        let generation_label = format!("{}/gen", self.config.label_prefix);
         for info in sandboxes.into_iter().rev() {
-            let Some(raw) = info.labels.get("infinity.hydro.run/gen") else {
+            let Some(raw) = info.labels.get(&generation_label) else {
                 continue;
             };
             let Ok(value) = raw.parse::<u64>() else {
@@ -575,7 +576,10 @@ impl Actor {
 
     fn key_labels(&self) -> BTreeMap<String, String> {
         let mut labels = self.config.labels.clone();
-        labels.insert("infinity.hydro.run/key".to_owned(), self.key.hash_hex());
+        labels.insert(
+            format!("{}/key", self.config.label_prefix),
+            self.key.hash_hex(),
+        );
         labels
     }
 
@@ -583,23 +587,23 @@ impl Actor {
         let mut labels = self.key_labels();
         labels.insert(
             "app.kubernetes.io/managed-by".to_owned(),
-            "infinity-openshell".to_owned(),
+            self.config.managed_by.clone(),
         );
         labels.insert(
-            "infinity.hydro.run/runtime".to_owned(),
+            format!("{}/runtime", self.config.label_prefix),
             env!("CARGO_PKG_VERSION").to_owned(),
         );
         labels.insert(
-            "infinity.hydro.run/tenant".to_owned(),
+            format!("{}/tenant", self.config.label_prefix),
             self.key.tenant_hash_hex(),
         );
         labels.insert(
-            "infinity.hydro.run/thread".to_owned(),
+            format!("{}/thread", self.config.label_prefix),
             self.key.thread_hash_hex(),
         );
         if let Some(generation) = self.generation {
             labels.insert(
-                "infinity.hydro.run/gen".to_owned(),
+                format!("{}/gen", self.config.label_prefix),
                 generation.as_u64().to_string(),
             );
         }
