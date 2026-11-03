@@ -65,6 +65,7 @@ mod openshell;
 mod providers;
 mod runtime;
 mod session;
+mod snapshot;
 mod token;
 
 pub use config::{
@@ -80,6 +81,7 @@ pub use ids::{Generation, SandboxName, SandboxPath, SessionKey, TenantId, Thread
 pub use providers::{ProviderAdmin, ProviderSpec};
 pub use runtime::{ReapReport, SessionRuntime};
 pub use session::Session;
+pub use snapshot::{SnapshotKey, SnapshotMeta, SnapshotPolicy, SnapshotStore};
 pub use token::{OidcCredentials, OidcRefreshToken, RefreshTokenStore, StaticToken, TokenSource};
 
 #[cfg(feature = "bootstrap")]

@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-/// Stable category for an [`Error`].
+/// Stable category for an [`enum@Error`].
 ///
 /// Callers should match on this rather than on error message text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +28,8 @@ pub enum ErrorKind {
     Unsupported,
     /// The execution outcome is unknown and must be reconciled.
     Uncertain,
+    /// A workspace archive could not be written or restored.
+    Snapshot,
     /// The gateway returned an error.
     Gateway,
     /// An internal invariant was violated.
@@ -79,6 +81,10 @@ pub enum Error {
     #[error("execution outcome is uncertain: {0}")]
     Uncertain(String),
 
+    /// A workspace archive could not be written or restored.
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
+
     /// The gateway returned an error.
     #[error("gateway error: {0}")]
     Gateway(String),
@@ -102,6 +108,7 @@ impl Error {
             Self::StaleSession => ErrorKind::StaleSession,
             Self::Unsupported(_) => ErrorKind::Unsupported,
             Self::Uncertain(_) => ErrorKind::Uncertain,
+            Self::Snapshot(_) => ErrorKind::Snapshot,
             Self::Gateway(_) => ErrorKind::Gateway,
             Self::Internal(_) => ErrorKind::Internal,
         }

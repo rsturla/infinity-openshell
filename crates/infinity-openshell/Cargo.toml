@@ -68,6 +68,11 @@ path = "examples/live_policy.rs"
 required-features = ["bootstrap"]
 
 [[example]]
+name = "snapshot_local"
+path = "examples/snapshot_local.rs"
+required-features = ["bootstrap"]
+
+[[example]]
 name = "live_rap"
 path = "examples/live_rap.rs"
 required-features = ["bootstrap"]

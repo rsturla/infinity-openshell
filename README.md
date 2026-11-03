@@ -24,6 +24,7 @@ thin optional front end for teams that have no service to embed it in.
 
 - One persistent workspace per conversation thread.
 - Idle stop, start on the next call, retention deletion, explicit close.
+- Optional workspace archives across deletion through the `SnapshotStore` seam.
 - Generation-bound leases, so a stale call cannot touch a replacement sandbox.
 - Cross-runtime adoption by label after a restart.
 - Streaming `exec` with subscription events and a bounded output cap.
@@ -116,6 +117,9 @@ OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example network_ac
 # Create-time sandbox policy
 OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example live_policy --features bootstrap
 
+# Archive and restore a workspace across sandbox deletion
+OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example snapshot_local --features bootstrap
+
 # Full Infinity agent -> RAP -> OpenShell
 OPENSHELL_TEST_GATEWAY=demo cargo run -p infinity-openshell --example agent --features bootstrap
 ```
@@ -158,6 +162,7 @@ OPENSHELL_TEST_GATEWAY=demo cargo test --features bootstrap -- --ignored
 
 - [Production design](docs/production-design.md)
 - [Network access, providers, and custom images](docs/network-access.md)
+- [Workspace archives](docs/workspace-snapshots.md)
 - [Journal and HA deployments](docs/ha-journal.md)
 - [RAP callbacks beyond tool results](docs/rap-callbacks.md)
 
@@ -170,6 +175,8 @@ OPENSHELL_TEST_GATEWAY=demo cargo test --features bootstrap -- --ignored
   `view_update`.
 - SigV4 signing is validated locally; a live Lambda Function URL needs AWS
   credentials and is deployment-specific.
+- Workspace archives use a client-supplied `SnapshotStore`. The repository has
+  a local filesystem example, not an S3 implementation.
 
 ## License
 

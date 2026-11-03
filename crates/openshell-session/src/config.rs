@@ -8,6 +8,7 @@ use std::time::Duration;
 use url::Url;
 
 use crate::error::Error;
+use crate::snapshot::{SnapshotPolicy, SnapshotStore};
 use crate::token::TokenSource;
 
 /// How a session releases compute when it goes idle.
@@ -205,6 +206,10 @@ pub struct RuntimeConfig {
     /// uses the gateway default, which denies all outbound network access
     /// unless an attached provider contributes rules.
     pub policy: Option<String>,
+    /// Workspace archive policy.
+    pub snapshot: SnapshotPolicy,
+    /// Archive storage. Required when [`SnapshotPolicy::enabled`] is true.
+    pub snapshot_store: Option<Arc<dyn SnapshotStore>>,
     /// Lifecycle and execution limits.
     pub lifecycle: LifecyclePolicy,
     /// Process-wide limits.
@@ -231,6 +236,8 @@ impl RuntimeConfig {
             image: None,
             providers: Vec::new(),
             policy: None,
+            snapshot: SnapshotPolicy::default(),
+            snapshot_store: None,
             lifecycle: LifecyclePolicy::default(),
             limits: Limits::default(),
             managed_by: "openshell-session".to_owned(),
@@ -338,6 +345,26 @@ impl RuntimeConfig {
                 Error::InvalidConfig(format!("invalid sandbox policy: {error}"))
             })?;
         }
+        if self.snapshot.enabled() && self.snapshot_store.is_none() {
+            return Err(Error::InvalidConfig(
+                "snapshot_store is required when snapshot archiving is enabled".to_owned(),
+            ));
+        }
+        if self.snapshot.max_archive_bytes == 0 {
+            return Err(Error::InvalidConfig(
+                "snapshot.max_archive_bytes must be greater than zero".to_owned(),
+            ));
+        }
+        if self.snapshot.timeout.is_zero() {
+            return Err(Error::InvalidConfig(
+                "snapshot.timeout must be greater than zero".to_owned(),
+            ));
+        }
+        if self.snapshot.temp_dir.as_os_str().is_empty() {
+            return Err(Error::InvalidConfig(
+                "snapshot.temp_dir must not be empty".to_owned(),
+            ));
+        }
         if self.managed_by.trim().is_empty()
             || self.managed_by.len() > 63
             || self.managed_by.chars().any(char::is_control)
@@ -401,6 +428,15 @@ mod tests {
             "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: example.com\n        port: 443\n    binaries:\n      - path: /usr/bin/curl\n"
                 .to_owned(),
         );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_snapshots_without_a_store() {
+        let mut config = RuntimeConfig::new(gateway());
+        config.snapshot.archive_on_delete = true;
+        assert!(config.validate().is_err());
+        config.snapshot.archive_on_delete = false;
         config.validate().unwrap();
     }
 

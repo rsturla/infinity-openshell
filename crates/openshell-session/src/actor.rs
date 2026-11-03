@@ -4,17 +4,22 @@
 //! lifecycle transition. Callers talk to it through a command channel.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures_util::StreamExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::{Instant, sleep};
 
 use crate::config::{RuntimeConfig, WakeStrategy};
 use crate::error::Error;
-use crate::gateway::{CreateSpec, Gateway, Phase};
-use crate::ids::{Generation, SandboxName, SessionKey};
+use crate::gateway::{CreateSpec, ExecEvent, ExecRequest, Gateway, Phase};
+use crate::ids::{Generation, SandboxName, SandboxPath, SessionKey};
+use crate::snapshot::SnapshotKey;
 
 /// A held lease on a ready sandbox.
 pub(crate) struct Lease {
@@ -252,6 +257,22 @@ impl Actor {
                             .wait_policy(&name, self.config.lifecycle.ready_timeout)
                             .await?;
                     }
+                    if self.config.snapshot.restore_on_create
+                        && let Err(error) = self.restore_workspace(&name).await
+                    {
+                        tracing::warn!(
+                            sandbox = %name,
+                            %error,
+                            "workspace restore failed; deleting the replacement sandbox"
+                        );
+                        let _ = self.gateway.delete(&name).await;
+                        self.sandbox = None;
+                        self.generation = None;
+                        self.phase = Phase::Absent;
+                        self.ever_created = false;
+                        self.current_generation.store(0, Ordering::SeqCst);
+                        return Err(error);
+                    }
                 }
                 Phase::Stopped | Phase::Completed => {
                     self.gateway.start(&name).await?;
@@ -458,6 +479,18 @@ impl Actor {
             return outcome;
         }
 
+        if self.config.snapshot.archive_on_delete
+            && self.phase != Phase::Error
+            && let Err(error) = self.archive_workspace(&name).await
+        {
+            tracing::warn!(
+                sandbox = %name,
+                %error,
+                "failed to archive the expired workspace; not deleting"
+            );
+            return outcome;
+        }
+
         if self.phase == Phase::Ready {
             match self.gateway.stop(&name).await {
                 Ok(()) => {
@@ -508,6 +541,9 @@ impl Actor {
     async fn close(&mut self) -> Result<(), Error> {
         self.alive.store(false, Ordering::SeqCst);
         if let Some(name) = self.sandbox.clone() {
+            if self.config.snapshot.archive_on_delete {
+                self.archive_workspace(&name).await?;
+            }
             self.gateway.delete(&name).await?;
             self.gateway
                 .wait_deleted(&name, self.config.lifecycle.delete_timeout)
@@ -519,6 +555,260 @@ impl Actor {
         self.leases = 0;
         self.stopped_at = None;
         Ok(())
+    }
+
+    fn snapshot_key(&self) -> SnapshotKey {
+        SnapshotKey::from_session(&self.key)
+    }
+
+    fn snapshot_directory(&self) -> std::path::PathBuf {
+        self.config
+            .snapshot
+            .temp_dir
+            .join(format!("openshell-snapshot-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Archive the workspace before the sandbox is deleted.
+    ///
+    /// A stopped sandbox is started for the duration of the archive. If the
+    /// archive fails, the caller must not delete the sandbox.
+    async fn archive_workspace(&mut self, name: &SandboxName) -> Result<(), Error> {
+        let Some(store) = self.config.snapshot_store.clone() else {
+            return Ok(());
+        };
+        let phase = match self.gateway.get(name).await? {
+            Some(info) => info.phase,
+            None => return Ok(()),
+        };
+        match phase {
+            Phase::Ready => {}
+            Phase::Stopped | Phase::Suspended | Phase::Completed => {
+                self.gateway.start(name).await?;
+                self.gateway
+                    .wait_ready(name, self.config.lifecycle.ready_timeout)
+                    .await?;
+                self.phase = Phase::Ready;
+            }
+            Phase::Provisioning | Phase::Starting => {
+                self.gateway
+                    .wait_ready(name, self.config.lifecycle.ready_timeout)
+                    .await?;
+                self.phase = Phase::Ready;
+            }
+            Phase::Stopping => {
+                self.wait_for(name, Phase::Stopped, self.config.lifecycle.stop_timeout)
+                    .await?;
+                self.gateway.start(name).await?;
+                self.gateway
+                    .wait_ready(name, self.config.lifecycle.ready_timeout)
+                    .await?;
+                self.phase = Phase::Ready;
+            }
+            Phase::Absent => return Ok(()),
+            Phase::Error => {
+                tracing::warn!(sandbox = %name, "skipping the archive for an errored sandbox");
+                return Ok(());
+            }
+            Phase::Deleting | Phase::Unknown => {
+                return Err(Error::Snapshot(format!(
+                    "cannot archive a sandbox in phase {phase:?}"
+                )));
+            }
+        }
+
+        let directory = self.snapshot_directory();
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .map_err(|error| {
+                Error::Snapshot(format!("cannot create snapshot directory: {error}"))
+            })?;
+        let archive = directory.join("workspace.tar");
+        let result = async {
+            let size = self.write_archive(name, &archive).await?;
+            if size == 0 {
+                return Ok(());
+            }
+            store.put(&self.snapshot_key(), &archive).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
+            tracing::warn!(%error, "cannot remove the snapshot temporary directory");
+        }
+        result
+    }
+
+    async fn write_archive(&self, name: &SandboxName, archive: &Path) -> Result<u64, Error> {
+        let mut stream = self
+            .gateway
+            .exec_stream(
+                name,
+                ExecRequest {
+                    argv: vec![
+                        "tar".to_owned(),
+                        "-C".to_owned(),
+                        self.config.workdir.clone(),
+                        "--exclude=./.openshell-snapshot".to_owned(),
+                        "-cf".to_owned(),
+                        "-".to_owned(),
+                        ".".to_owned(),
+                    ],
+                    workdir: Some(self.config.workdir.clone()),
+                    env: BTreeMap::new(),
+                    stdin: None,
+                    timeout: Some(self.config.snapshot.timeout),
+                    max_output_bytes: 0,
+                    request_id: None,
+                },
+            )
+            .await?;
+        let mut file = tokio::fs::File::create(archive)
+            .await
+            .map_err(|error| Error::Snapshot(format!("cannot create the archive: {error}")))?;
+        let mut written = 0_u64;
+        let mut stderr = Vec::new();
+        let mut exit = None;
+        while let Some(event) = stream.next().await {
+            match event? {
+                ExecEvent::Stdout(chunk) => {
+                    written += chunk.len() as u64;
+                    if written > self.config.snapshot.max_archive_bytes {
+                        return Err(Error::Snapshot(format!(
+                            "workspace archive exceeds {} bytes",
+                            self.config.snapshot.max_archive_bytes
+                        )));
+                    }
+                    file.write_all(&chunk).await.map_err(|error| {
+                        Error::Snapshot(format!("cannot write the archive: {error}"))
+                    })?;
+                }
+                ExecEvent::Stderr(chunk) => {
+                    if stderr.len() < 64 * 1024 {
+                        stderr.extend_from_slice(&chunk);
+                    }
+                }
+                ExecEvent::Exited { code } => {
+                    exit = Some(code);
+                    break;
+                }
+            }
+        }
+        file.flush()
+            .await
+            .map_err(|error| Error::Snapshot(format!("cannot flush the archive: {error}")))?;
+        if exit != Some(0) {
+            return Err(Error::Snapshot(format!(
+                "workspace archive failed (exit {:?}): {}",
+                exit,
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
+        Ok(written)
+    }
+
+    /// Restore the latest archive into a new sandbox.
+    async fn restore_workspace(&self, name: &SandboxName) -> Result<(), Error> {
+        if !self.config.snapshot.restore_on_create {
+            return Ok(());
+        }
+        let Some(store) = &self.config.snapshot_store else {
+            return Ok(());
+        };
+        let directory = self.snapshot_directory();
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .map_err(|error| {
+                Error::Snapshot(format!("cannot create snapshot directory: {error}"))
+            })?;
+        let archive = directory.join("workspace.tar");
+        let result = async {
+            if !store.get(&self.snapshot_key(), &archive).await? {
+                return Ok(());
+            }
+            let size = tokio::fs::metadata(&archive)
+                .await
+                .map_err(|error| Error::Snapshot(format!("cannot read the archive: {error}")))?
+                .len();
+            if size == 0 {
+                return Ok(());
+            }
+            if size > self.config.snapshot.max_archive_bytes {
+                return Err(Error::Snapshot(format!(
+                    "workspace archive is {size} bytes, above the {} byte limit",
+                    self.config.snapshot.max_archive_bytes
+                )));
+            }
+
+            let chunk_size = self
+                .config
+                .lifecycle
+                .max_input_bytes
+                .clamp(1, 4 * 1024 * 1024);
+            let mut file = tokio::fs::File::open(&archive)
+                .await
+                .map_err(|error| Error::Snapshot(format!("cannot open the archive: {error}")))?;
+            let mut buffer = vec![0_u8; chunk_size];
+            let mut index = 0_u32;
+            loop {
+                let read = file.read(&mut buffer).await.map_err(|error| {
+                    Error::Snapshot(format!("cannot read the archive: {error}"))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                let path = SandboxPath::new(format!(".openshell-snapshot/part-{index:05}"))?;
+                self.gateway
+                    .write_file(
+                        name,
+                        &path,
+                        Bytes::copy_from_slice(&buffer[..read]),
+                        None,
+                    )
+                    .await?;
+                index += 1;
+            }
+            if index == 0 {
+                return Ok(());
+            }
+
+            let output = self
+                .gateway
+                .exec(
+                    name,
+                    ExecRequest {
+                        argv: vec![
+                            "sh".to_owned(),
+                            "-c".to_owned(),
+                            "set -e; cat .openshell-snapshot/part-* > .openshell-snapshot/archive.tar; \
+                             tar --no-same-owner --no-same-permissions --touch --no-overwrite-dir \
+                             -xf .openshell-snapshot/archive.tar -C \"$1\"; \
+                             rm -rf .openshell-snapshot"
+                                .to_owned(),
+                            "sh".to_owned(),
+                            self.config.workdir.clone(),
+                        ],
+                        workdir: Some(self.config.workdir.clone()),
+                        env: BTreeMap::new(),
+                        stdin: None,
+                        timeout: Some(self.config.snapshot.timeout),
+                        max_output_bytes: self.config.lifecycle.max_output_bytes,
+                        request_id: None,
+                    },
+                )
+                .await?;
+            if output.code != 0 {
+                return Err(Error::Snapshot(format!(
+                    "workspace restore failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
+            tracing::warn!(%error, "cannot remove the snapshot temporary directory");
+        }
+        result
     }
 
     async fn wait_for(
