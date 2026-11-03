@@ -28,6 +28,7 @@ pub struct ReapReport {
 /// The runtime owns one lifecycle actor per [`SessionKey`]. It is safe to share
 /// across tasks. Dropping the runtime shuts down its actors; retained sandboxes
 /// are left for the next runtime or for operator cleanup.
+#[derive(Clone)]
 pub struct SessionRuntime {
     inner: Arc<Inner>,
 }
@@ -38,6 +39,7 @@ struct ActorHandle {
     tx: mpsc::UnboundedSender<Command>,
     alive: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    created: Arc<AtomicBool>,
 }
 
 struct Inner {
@@ -46,6 +48,7 @@ struct Inner {
     actors: Mutex<HashMap<SessionKey, ActorHandle>>,
     next_actor_id: AtomicU64,
     shutdown: AtomicBool,
+    reaper_started: AtomicBool,
 }
 
 impl SessionRuntime {
@@ -63,6 +66,7 @@ impl SessionRuntime {
                 actors: Mutex::new(HashMap::new()),
                 next_actor_id: AtomicU64::new(1),
                 shutdown: AtomicBool::new(false),
+                reaper_started: AtomicBool::new(false),
             }),
         })
     }
@@ -76,7 +80,36 @@ impl SessionRuntime {
     #[cfg(feature = "openshell")]
     pub async fn open(config: RuntimeConfig) -> Result<Self, Error> {
         let gateway = Arc::new(crate::openshell::OpenShellGateway::connect(&config).await?);
-        Self::new(gateway, config)
+        let runtime = Self::new(gateway, config)?;
+        runtime.start_reaper();
+        Ok(runtime)
+    }
+
+    /// Start the automatic retention sweeper if it is not already running.
+    ///
+    /// [`SessionRuntime::open`] calls this. Call it directly when the runtime
+    /// was built with [`SessionRuntime::new`] and an injected gateway.
+    pub fn start_reaper(&self) {
+        if self.inner.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let interval = self.inner.config.lifecycle.reap_interval;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let runtime = SessionRuntime { inner };
+                if let Err(error) = runtime.reap().await {
+                    tracing::warn!(%error, "automatic session reap failed");
+                }
+            }
+        });
     }
 
     /// Acquire a lease on the thread's sandbox, creating or starting it when
@@ -102,9 +135,21 @@ impl SessionRuntime {
                 "session actor stopped before the request was queued".to_owned(),
             ));
         }
-        let lease = receiver
-            .await
-            .map_err(|_| Error::Internal("session actor dropped its reply".to_owned()))??;
+        let lease = match receiver.await {
+            Ok(Ok(lease)) => lease,
+            Ok(Err(error)) => {
+                if !handle.created.load(Ordering::SeqCst) {
+                    self.remove_if_current(&key, handle.id);
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                self.remove_if_current(&key, handle.id);
+                return Err(Error::Internal(
+                    "session actor dropped its reply".to_owned(),
+                ));
+            }
+        };
         Ok(Session::new(self.inner.gateway.clone(), lease))
     }
 
@@ -126,6 +171,15 @@ impl SessionRuntime {
                 .cloned()
         };
         let Some(handle) = handle else {
+            let labels = self.key_labels(key);
+            let sandboxes = self.inner.gateway.list_managed(&labels).await?;
+            for sandbox in sandboxes {
+                self.inner.gateway.delete(&sandbox.name).await?;
+                self.inner
+                    .gateway
+                    .wait_deleted(&sandbox.name, self.inner.config.lifecycle.delete_timeout)
+                    .await?;
+            }
             return Ok(());
         };
         handle.alive.store(false, Ordering::SeqCst);
@@ -186,20 +240,7 @@ impl SessionRuntime {
     ///
     /// Sessions that outlive the call return [`Error::StaleSession`].
     pub fn shutdown(&self) {
-        self.inner.shutdown.store(true, Ordering::SeqCst);
-        let handles: Vec<_> = self
-            .inner
-            .actors
-            .lock()
-            .expect("bug: actor map poisoned")
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect();
-        for handle in handles {
-            handle.shutdown.store(true, Ordering::SeqCst);
-            handle.alive.store(false, Ordering::SeqCst);
-            let _ = handle.tx.send(Command::Shutdown);
-        }
+        self.inner.shutdown_actors();
     }
 
     fn actor_handle(&self, key: &SessionKey) -> Result<ActorHandle, Error> {
@@ -221,6 +262,7 @@ impl SessionRuntime {
         let id = self.inner.next_actor_id.fetch_add(1, Ordering::Relaxed);
         let alive = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let created = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::unbounded_channel();
         let actor = Actor::new(
             self.inner.gateway.clone(),
@@ -230,6 +272,7 @@ impl SessionRuntime {
             sender.clone(),
             alive.clone(),
             shutdown.clone(),
+            created.clone(),
         );
         tokio::spawn(actor.run());
         let handle = ActorHandle {
@@ -237,9 +280,23 @@ impl SessionRuntime {
             tx: sender,
             alive,
             shutdown,
+            created,
         };
         actors.insert(key.clone(), handle.clone());
         Ok(handle)
+    }
+
+    fn key_labels(&self, key: &SessionKey) -> std::collections::BTreeMap<String, String> {
+        let mut labels = self.inner.config.labels.clone();
+        labels.insert(
+            format!("{}/key", self.inner.config.label_prefix),
+            key.hash_hex(),
+        );
+        labels.insert(
+            "app.kubernetes.io/managed-by".to_owned(),
+            self.inner.config.managed_by.clone(),
+        );
+        labels
     }
 
     fn remove_if_current(&self, key: &SessionKey, id: u64) {
@@ -250,9 +307,27 @@ impl SessionRuntime {
     }
 }
 
-impl Drop for SessionRuntime {
+impl Inner {
+    fn shutdown_actors(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let handles: Vec<_> = self
+            .actors
+            .lock()
+            .expect("bug: actor map poisoned")
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
+        for handle in handles {
+            handle.shutdown.store(true, Ordering::SeqCst);
+            handle.alive.store(false, Ordering::SeqCst);
+            let _ = handle.tx.send(Command::Shutdown);
+        }
+    }
+}
+
+impl Drop for Inner {
     fn drop(&mut self) {
-        self.shutdown();
+        self.shutdown_actors();
     }
 }
 
@@ -385,6 +460,22 @@ mod tests {
         let runtime = SessionRuntime::new(gateway, config()).unwrap();
         runtime.close(&key()).await.unwrap();
         runtime.close(&key()).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_deletes_a_retained_sandbox_after_restart() {
+        let gateway = Arc::new(FakeGateway::new());
+        let key = key();
+        let first = SessionRuntime::new(gateway.clone(), config()).unwrap();
+        let session = first.acquire(key.clone()).await.unwrap();
+        let name = session.name().clone();
+        drop(session);
+        drop(first);
+        assert!(gateway.get(&name).await.unwrap().is_some());
+
+        let second = SessionRuntime::new(gateway.clone(), config()).unwrap();
+        second.close(&key).await.unwrap();
+        assert!(gateway.get(&name).await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -552,6 +643,45 @@ mod tests {
         settle().await;
         let report = runtime.reap().await.unwrap();
         assert_eq!(report.deleted, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_automatic_reaper_deletes_an_expired_sandbox() {
+        let gateway = Arc::new(FakeGateway::new());
+        let mut config = config();
+        config.lifecycle.idle_after = Duration::from_secs(1);
+        config.lifecycle.retain_for = Duration::from_secs(2);
+        config.lifecycle.reap_interval = Duration::from_secs(1);
+        let runtime = SessionRuntime::new(gateway.clone(), config).unwrap();
+        runtime.start_reaper();
+        let key = key();
+
+        let session = runtime.acquire(key.clone()).await.unwrap();
+        let name = session.name().clone();
+        drop(session);
+
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            settle().await;
+        }
+        assert!(
+            gateway.get(&name).await.unwrap().is_none(),
+            "the automatic reaper did not delete the expired sandbox"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_create_does_not_consume_a_session_slot() {
+        let gateway = Arc::new(FakeGateway::new());
+        let mut config = config();
+        config.limits.max_sessions = 1;
+        let runtime = SessionRuntime::new(gateway.clone(), config).unwrap();
+        let key = key();
+
+        gateway.fail_next("create");
+        assert!(runtime.acquire(key.clone()).await.is_err());
+        // The actor never created a sandbox, so the slot must be free.
+        runtime.acquire(key).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

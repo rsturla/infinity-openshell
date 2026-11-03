@@ -132,6 +132,8 @@ pub struct LifecyclePolicy {
     pub idle_after: Duration,
     /// Time a stopped sandbox is retained before deletion.
     pub retain_for: Duration,
+    /// Time between automatic retention sweeps.
+    pub reap_interval: Duration,
     /// Timeout for a sandbox to become ready.
     pub ready_timeout: Duration,
     /// Timeout for a sandbox to stop.
@@ -154,6 +156,7 @@ impl Default for LifecyclePolicy {
             wake: WakeStrategy::StopStart,
             idle_after: Duration::from_secs(60),
             retain_for: Duration::from_secs(24 * 60 * 60),
+            reap_interval: Duration::from_secs(30),
             ready_timeout: Duration::from_secs(120),
             stop_timeout: Duration::from_secs(60),
             delete_timeout: Duration::from_secs(60),
@@ -287,6 +290,11 @@ impl RuntimeConfig {
         if self.lifecycle.retain_for <= self.lifecycle.idle_after {
             return Err(Error::InvalidConfig(
                 "retain_for must be greater than idle_after".to_owned(),
+            ));
+        }
+        if self.lifecycle.reap_interval.is_zero() {
+            return Err(Error::InvalidConfig(
+                "reap_interval must be greater than zero".to_owned(),
             ));
         }
         for (name, value) in [

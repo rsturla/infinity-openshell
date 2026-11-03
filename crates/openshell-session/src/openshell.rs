@@ -263,17 +263,20 @@ impl Gateway for OpenShellGateway {
     async fn wait_policy(&self, name: &SandboxName, timeout: Duration) -> Result<(), Error> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let mut grpc = self.client.raw_grpc_fresh().await.map_err(map_sdk)?;
-            let response = grpc
-                .get_sandbox_policy_status(proto::GetSandboxPolicyStatusRequest {
+            let response = tokio::time::timeout(self.control_timeout, async {
+                let mut grpc = self.client.raw_grpc_fresh().await.map_err(map_sdk)?;
+                grpc.get_sandbox_policy_status(proto::GetSandboxPolicyStatusRequest {
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                     version: 0,
                     global: false,
                     sandbox: name.as_str().to_owned(),
                 })
                 .await
-                .map_err(|status| map_sdk(SdkError::from_status(status)))?
-                .into_inner();
+                .map_err(|status| map_sdk(SdkError::from_status(status)))
+                .map(|response| response.into_inner())
+            })
+            .await
+            .map_err(|_| Error::Timeout("policy status request timed out".to_owned()))??;
             match response.revision {
                 Some(revision) => match proto::PolicyStatus::try_from(revision.status) {
                     Ok(proto::PolicyStatus::Loaded) => return Ok(()),

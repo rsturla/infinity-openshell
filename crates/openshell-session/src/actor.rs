@@ -87,11 +87,13 @@ pub(crate) struct Actor {
     alive: Arc<AtomicBool>,
     current_generation: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+    created: Arc<AtomicBool>,
     ever_created: bool,
     exec_permits: Arc<Semaphore>,
 }
 
 impl Actor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gateway: Arc<dyn Gateway>,
         config: RuntimeConfig,
@@ -100,6 +102,7 @@ impl Actor {
         tx: mpsc::UnboundedSender<Command>,
         alive: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
+        created: Arc<AtomicBool>,
     ) -> Self {
         let exec_permits = Arc::new(Semaphore::new(config.lifecycle.max_concurrent_execs));
         Self {
@@ -117,6 +120,7 @@ impl Actor {
             alive,
             current_generation: Arc::new(AtomicU64::new(0)),
             shutdown,
+            created,
             ever_created: false,
             exec_permits,
         }
@@ -197,7 +201,7 @@ impl Actor {
             if let Some((name, generation)) = self.adopt().await? {
                 self.set_generation(generation);
                 self.sandbox = Some(name);
-                self.ever_created = true;
+                self.mark_created();
             } else {
                 let generation = Generation::new();
                 self.set_generation(generation);
@@ -248,7 +252,7 @@ impl Actor {
                         })
                         .await?;
                     self.phase = created.phase;
-                    self.ever_created = true;
+                    self.mark_created();
                     self.gateway
                         .wait_ready(&name, self.config.lifecycle.ready_timeout)
                         .await?;
@@ -279,21 +283,21 @@ impl Actor {
                     self.gateway
                         .wait_ready(&name, self.config.lifecycle.ready_timeout)
                         .await?;
-                    self.ever_created = true;
+                    self.mark_created();
                 }
                 Phase::Suspended => match self.gateway.resume(&name).await {
                     Ok(()) => {
                         self.gateway
                             .wait_ready(&name, self.config.lifecycle.ready_timeout)
                             .await?;
-                        self.ever_created = true;
+                        self.mark_created();
                     }
                     Err(Error::Unsupported(_)) => {
                         self.gateway.start(&name).await?;
                         self.gateway
                             .wait_ready(&name, self.config.lifecycle.ready_timeout)
                             .await?;
-                        self.ever_created = true;
+                        self.mark_created();
                     }
                     Err(error) => return Err(error),
                 },
@@ -301,7 +305,7 @@ impl Actor {
                     self.gateway
                         .wait_ready(&name, self.config.lifecycle.ready_timeout)
                         .await?;
-                    self.ever_created = true;
+                    self.mark_created();
                 }
                 Phase::Stopping => {
                     self.wait_for(&name, Phase::Stopped, self.config.lifecycle.stop_timeout)
@@ -310,7 +314,7 @@ impl Actor {
                     self.gateway
                         .wait_ready(&name, self.config.lifecycle.ready_timeout)
                         .await?;
-                    self.ever_created = true;
+                    self.mark_created();
                 }
                 Phase::Error => {
                     if self.leases > 0 {
@@ -330,7 +334,7 @@ impl Actor {
                     self.gateway
                         .wait_ready(&name, self.config.lifecycle.ready_timeout)
                         .await?;
-                    self.ever_created = true;
+                    self.mark_created();
                     continue;
                 }
                 Phase::Deleting => {
@@ -720,6 +724,11 @@ impl Actor {
             })?;
         let archive = directory.join("workspace.tar");
         let result = async {
+            tokio::fs::File::create(&archive)
+                .await
+                .map_err(|error| {
+                    Error::Snapshot(format!("cannot create the restore file: {error}"))
+                })?;
             if !store.get(&self.snapshot_key(), &archive).await? {
                 return Ok(());
             }
@@ -849,6 +858,11 @@ impl Actor {
             return Ok(Some((info.name, Generation::from_raw(value))));
         }
         Ok(None)
+    }
+
+    fn mark_created(&mut self) {
+        self.ever_created = true;
+        self.created.store(true, Ordering::SeqCst);
     }
 
     fn set_generation(&mut self, generation: Generation) {
