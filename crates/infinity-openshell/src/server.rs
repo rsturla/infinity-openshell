@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -52,6 +52,11 @@ struct AppState {
 /// Returns a configuration, journal, or callback client error.
 pub async fn router(runtime: SessionRuntime, config: ServerConfig) -> Result<Router, Error> {
     config.validate()?;
+    if config.journal_path.is_none() && !config.allow_ephemeral {
+        return Err(Error::InvalidConfig(
+            "journal_path is required; set allow_ephemeral for an in-memory journal".to_owned(),
+        ));
+    }
     let callback = build_callback(&config).await?;
     let journal: Arc<dyn Journal> = if let Some(path) = &config.journal_path {
         Arc::new(FileJournal::open(path).await?)
@@ -75,6 +80,8 @@ pub async fn router_with_callback(
     journal: Arc<dyn Journal>,
     callback: Arc<dyn CallbackClient>,
 ) -> Result<Router, Error> {
+    config.validate()?;
+    let body_limit = config.max_input_bytes.saturating_add(64 * 1024);
     let state = Arc::new(AppState {
         runtime,
         config,
@@ -100,6 +107,7 @@ pub async fn router_with_callback(
         .route("/healthz", get(health_handler))
         .route("/readyz", get(health_handler))
         .merge(protected)
+        .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state))
 }
 
@@ -338,6 +346,10 @@ async fn execute(state: &AppState, invocation: &RapInvocation) -> Result<String,
     match invocation.operation.as_str() {
         "openshell_exec" => {
             let args: ExecArgs = parse_args(invocation)?;
+            if let Some(cwd) = &args.cwd {
+                SandboxPath::new(cwd.clone())
+                    .map_err(|error| Error::InvalidArguments(error.to_string()))?;
+            }
             let session = acquire(state, invocation).await?;
             let mut request = ExecRequest::new(args.command);
             request.workdir = args.cwd;
@@ -397,6 +409,7 @@ async fn execute(state: &AppState, invocation: &RapInvocation) -> Result<String,
                                 send_event(state, invocation, format!("Error: {error}"), true).await;
                                 return Err(Error::Session(error));
                             }
+                            Some(Ok(_)) => {}
                             None => break,
                         }
                         if pending.len() >= 64 * 1024 {

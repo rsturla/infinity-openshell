@@ -189,7 +189,7 @@ fn ten_agents_run_in_parallel() {
             .await
             .expect("bind the RAP server");
         let port = listener.local_addr().expect("address").port();
-        let config = ServerConfig::new(
+        let config = ServerConfig::ephemeral(
             Url::parse(&format!("http://127.0.0.1:{port}")).expect("base URL"),
             TenantId::new("scale").expect("tenant"),
         );

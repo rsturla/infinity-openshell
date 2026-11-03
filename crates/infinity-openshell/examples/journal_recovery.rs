@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             GatewayAuth::None,
         )),
     )?;
-    let config = ServerConfig::new(Url::parse("http://tools.test")?, TenantId::new("demo")?);
+    let config = ServerConfig::ephemeral(Url::parse("http://tools.test")?, TenantId::new("demo")?);
     let (sender, mut results) = mpsc::unbounded_channel();
     let callback = Arc::new(PrintCallback { results: sender });
     let journal = Arc::new(FileJournal::open(&path).await?);

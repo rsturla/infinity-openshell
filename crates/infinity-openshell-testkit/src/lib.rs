@@ -87,7 +87,7 @@ impl TestServer {
         )
         .expect("test runtime configuration");
 
-        let mut config = ServerConfig::new(
+        let mut config = ServerConfig::ephemeral(
             Url::parse("http://tools.test").expect("valid test URL"),
             TenantId::new("test").expect("valid tenant"),
         );

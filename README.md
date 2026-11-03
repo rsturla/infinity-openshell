@@ -47,11 +47,14 @@ read, and close.
 
 ```shell
 cargo run --features cli --bin infinity-openshell -- \
-  check --gateway demo --base-url http://127.0.0.1:3001
+  check --gateway demo --base-url http://127.0.0.1:3001 --journal ./journal.jsonl
 
 cargo run --features cli --bin infinity-openshell -- \
-  serve --gateway demo --base-url http://127.0.0.1:3001
+  serve --gateway demo --base-url http://127.0.0.1:3001 --journal ./journal.jsonl
 ```
+
+`--journal` is required. Use `--allow-ephemeral` only for a local development
+server with an in-memory journal.
 
 Registration with Infinity:
 

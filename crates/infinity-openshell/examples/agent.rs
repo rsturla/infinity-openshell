@@ -110,7 +110,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let runtime = SessionRuntime::open(runtime_config).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let config = ServerConfig::new(
+    let config = ServerConfig::ephemeral(
         Url::parse(&format!("http://127.0.0.1:{port}"))?,
         TenantId::new("example")?,
     );

@@ -112,6 +112,7 @@ impl ExecRequest {
 
 /// One event from a streaming command.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum ExecEvent {
     /// Standard output chunk.
     Stdout(Bytes),

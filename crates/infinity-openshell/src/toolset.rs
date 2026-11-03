@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn manifest_names_are_unique_and_endpoint_comes_from_config() {
-        let config = ServerConfig::new(
+        let config = ServerConfig::ephemeral(
             Url::parse("https://tools.example.com/base/").unwrap(),
             TenantId::new("acme").unwrap(),
         );

@@ -86,6 +86,9 @@ struct ServeArgs {
     /// Allow an unauthenticated server on a non-loopback bind. Development only.
     #[arg(long, default_value_t = false)]
     allow_unauthenticated: bool,
+    /// Allow an in-memory journal. Development only.
+    #[arg(long, default_value_t = false)]
+    allow_ephemeral: bool,
     /// Allow non-loopback plain HTTP callbacks. Development only.
     #[arg(long, default_value_t = false)]
     allow_insecure_callback_http: bool,
@@ -189,6 +192,15 @@ impl ServeArgs {
             },
         };
         config.journal_path = self.journal.clone();
+        config.allow_ephemeral = self.allow_ephemeral;
+        config.allow_unauthenticated = self.allow_unauthenticated;
+        if config.journal_path.is_none() && !config.allow_ephemeral {
+            return Err(
+                "--journal is required; pass --allow-ephemeral for an in-memory journal"
+                    .to_owned()
+                    .into(),
+            );
+        }
         config.callback_allowed_hosts = self.callback_allowed_hosts.clone();
         config.allow_insecure_callback_http = self.allow_insecure_callback_http;
         config.stream_interval = Duration::from_secs(self.stream_interval_seconds);

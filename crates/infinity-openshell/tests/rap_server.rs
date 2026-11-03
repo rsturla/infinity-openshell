@@ -64,7 +64,7 @@ async fn harness_with_auth_and_journal(auth: InboundAuth, journal: Arc<dyn Journ
     );
     let runtime = SessionRuntime::new(gateway.clone(), RuntimeConfig::new(gateway_config)).unwrap();
 
-    let mut config = ServerConfig::new(
+    let mut config = ServerConfig::ephemeral(
         Url::parse("http://tools.test").unwrap(),
         TenantId::new("acme").unwrap(),
     );

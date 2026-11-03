@@ -65,13 +65,21 @@ pub struct ServerConfig {
     pub callback_auth: CallbackAuth,
     /// Optional append-only journal path. `None` keeps the journal in memory.
     pub journal_path: Option<PathBuf>,
+    /// Allow an in-memory journal.
+    ///
+    /// Development and tests only. Leave `false` for a production server.
+    pub allow_ephemeral: bool,
+    /// Allow inbound authentication to be disabled on a non-loopback base URL.
+    ///
+    /// Development only. Leave `false` for a production server.
+    pub allow_unauthenticated: bool,
     /// HTTP timeout for one callback attempt.
     pub callback_timeout: Duration,
     /// Maximum callback delivery attempts.
     pub callback_attempts: usize,
     /// Base backoff between callback attempts.
     pub callback_backoff: Duration,
-    /// Allowed callback hosts. Empty allows any HTTPS host.
+    /// Allowed callback hosts. Empty allows loopback only.
     pub callback_allowed_hosts: Vec<String>,
     /// Allow non-loopback plain HTTP callback URLs. Development only.
     pub allow_insecure_callback_http: bool,
@@ -79,6 +87,8 @@ pub struct ServerConfig {
     pub stream_interval: Duration,
     /// Maximum bytes retained for one tool result.
     pub max_output_bytes: usize,
+    /// Maximum bytes accepted in one request body.
+    pub max_input_bytes: usize,
 }
 
 impl ServerConfig {
@@ -91,6 +101,8 @@ impl ServerConfig {
             inbound_auth: InboundAuth::None,
             callback_auth: CallbackAuth::Plain,
             journal_path: None,
+            allow_ephemeral: false,
+            allow_unauthenticated: false,
             callback_timeout: Duration::from_secs(10),
             callback_attempts: 5,
             callback_backoff: Duration::from_millis(250),
@@ -98,7 +110,19 @@ impl ServerConfig {
             allow_insecure_callback_http: false,
             stream_interval: Duration::from_secs(10),
             max_output_bytes: 1024 * 1024,
+            max_input_bytes: 8 * 1024 * 1024,
         }
+    }
+
+    /// Construct a development configuration.
+    ///
+    /// It allows an in-memory journal and no inbound authentication. Do not use
+    /// it for a production server.
+    pub fn ephemeral(base_url: Url, tenant: TenantId) -> Self {
+        let mut config = Self::new(base_url, tenant);
+        config.allow_ephemeral = true;
+        config.allow_unauthenticated = true;
+        config
     }
 
     /// Validate the configuration.
@@ -106,8 +130,18 @@ impl ServerConfig {
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfig`] for an unsupported scheme, an empty
-    /// name, or a zero retry or timeout setting.
+    /// name, a zero retry or timeout setting, or an unauthenticated
+    /// non-loopback base URL.
     pub fn validate(&self) -> Result<(), Error> {
+        if !self.allow_ephemeral
+            && !self.allow_unauthenticated
+            && matches!(self.inbound_auth, InboundAuth::None)
+            && !is_loopback_url(&self.base_url)
+        {
+            return Err(Error::InvalidConfig(
+                "inbound_auth is required for a non-loopback base_url".to_owned(),
+            ));
+        }
         if !matches!(self.base_url.scheme(), "http" | "https") {
             return Err(Error::InvalidConfig(
                 "base_url must use http or https".to_owned(),
@@ -152,6 +186,11 @@ impl ServerConfig {
                 "max_output_bytes must be greater than zero".to_owned(),
             ));
         }
+        if self.max_input_bytes == 0 {
+            return Err(Error::InvalidConfig(
+                "max_input_bytes must be greater than zero".to_owned(),
+            ));
+        }
         if let CallbackAuth::SigV4 { service, .. } = &self.callback_auth
             && service.trim().is_empty()
         {
@@ -168,20 +207,51 @@ impl ServerConfig {
     }
 }
 
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn config() -> ServerConfig {
-        ServerConfig::new(
+        ServerConfig::ephemeral(
             Url::parse("https://tools.example.com").unwrap(),
             TenantId::new("acme").unwrap(),
         )
     }
 
     #[test]
-    fn defaults_are_valid() {
+    fn ephemeral_defaults_are_valid() {
         config().validate().unwrap();
+    }
+
+    #[test]
+    fn a_non_loopback_server_requires_authentication() {
+        let mut config = ServerConfig::new(
+            Url::parse("https://tools.example.com").unwrap(),
+            TenantId::new("acme").unwrap(),
+        );
+        assert!(config.validate().is_err());
+        config.inbound_auth = InboundAuth::Bearer {
+            token: "shared-secret".to_owned(),
+        };
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_loopback_server_may_skip_authentication() {
+        let config = ServerConfig::new(
+            Url::parse("http://127.0.0.1:3001").unwrap(),
+            TenantId::new("acme").unwrap(),
+        );
+        config.validate().unwrap();
     }
 
     #[test]

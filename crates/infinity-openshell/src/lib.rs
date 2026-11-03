@@ -28,6 +28,7 @@
 //!     TenantId::new("acme")?,
 //! );
 //! config.inbound_auth = InboundAuth::Bearer { token: "shared-secret".to_owned() };
+//! config.journal_path = Some("journal.jsonl".into());
 //! let app = infinity_openshell::router(runtime, config).await?;
 //!
 //! let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -51,7 +52,7 @@ pub use callback::SigV4CallbackClient;
 pub use callback::{CallbackClient, CallbackError, PlainCallbackClient};
 pub use config::{CallbackAuth, InboundAuth, ServerConfig};
 pub use error::Error;
-pub use journal::{Accept, FileJournal, Journal, MemoryJournal, Pending};
+pub use journal::{Accept, FileJournal, Journal, MemoryJournal, Pending, Recovered};
 pub use server::{router, router_with_callback};
 pub use toolset::manifest;
 

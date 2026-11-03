@@ -6,6 +6,7 @@ use std::time::Duration;
 
 /// Callback delivery error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CallbackError {
     /// The callback URL is invalid or not allowed.
     #[error("callback URL is invalid: {0}")]
@@ -270,7 +271,10 @@ fn validate_callback_url(
 }
 
 fn is_loopback(url: &url::Url) -> bool {
-    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
+    matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    )
 }
 
 /// Strip the URL from a reqwest error. Callback URLs can contain bearer

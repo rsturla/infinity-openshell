@@ -102,7 +102,7 @@ async fn live_rap_exec_read_and_close() {
         .await
         .expect("bind the RAP server");
     let port = listener.local_addr().expect("local address").port();
-    let config = infinity_openshell::ServerConfig::new(
+    let config = infinity_openshell::ServerConfig::ephemeral(
         Url::parse(&format!("http://127.0.0.1:{port}")).expect("base URL"),
         TenantId::new("live").expect("tenant"),
     );
