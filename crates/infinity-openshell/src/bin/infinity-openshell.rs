@@ -110,9 +110,10 @@ struct ServeArgs {
     /// Seconds between streaming subscription events.
     #[arg(long, default_value_t = 10)]
     stream_interval_seconds: u64,
-    /// Working directory inside the sandbox.
-    #[arg(long, default_value = "/sandbox")]
-    workdir: String,
+    /// Working directory inside the sandbox. Defaults to the sandbox
+    /// workspace selected by OpenShell.
+    #[arg(long, env = "OPENSHELL_WORKDIR")]
+    workdir: Option<String>,
 }
 
 impl ServeArgs {

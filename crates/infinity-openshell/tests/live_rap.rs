@@ -30,7 +30,6 @@ fn live_config(gateway_name: &str) -> RuntimeConfig {
         GatewayAuth::OidcSource { source },
     ));
     infinity_openshell::configure_labels(&mut config);
-    config.workdir = "/sandbox".to_owned();
     config.lifecycle.idle_after = Duration::from_secs(300);
     config.lifecycle.retain_for = Duration::from_secs(3600);
     config.lifecycle.ready_timeout = Duration::from_secs(120);

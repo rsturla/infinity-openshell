@@ -646,14 +646,12 @@ impl Actor {
                 ExecRequest {
                     argv: vec![
                         "tar".to_owned(),
-                        "-C".to_owned(),
-                        self.config.workdir.clone(),
                         "--exclude=./.openshell-snapshot".to_owned(),
                         "-cf".to_owned(),
                         "-".to_owned(),
                         ".".to_owned(),
                     ],
-                    workdir: Some(self.config.workdir.clone()),
+                    workdir: self.config.workdir.clone(),
                     env: BTreeMap::new(),
                     stdin: None,
                     timeout: Some(self.config.snapshot.timeout),
@@ -781,13 +779,12 @@ impl Actor {
                             "-c".to_owned(),
                             "set -e; cat .openshell-snapshot/part-* > .openshell-snapshot/archive.tar; \
                              tar --no-same-owner --no-same-permissions --touch --no-overwrite-dir \
-                             -xf .openshell-snapshot/archive.tar -C \"$1\"; \
+                             -xf .openshell-snapshot/archive.tar -C .; \
                              rm -rf .openshell-snapshot"
                                 .to_owned(),
                             "sh".to_owned(),
-                            self.config.workdir.clone(),
                         ],
-                        workdir: Some(self.config.workdir.clone()),
+                        workdir: self.config.workdir.clone(),
                         env: BTreeMap::new(),
                         stdin: None,
                         timeout: Some(self.config.snapshot.timeout),

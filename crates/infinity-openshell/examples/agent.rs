@@ -102,7 +102,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         GatewayAuth::OidcSource { source },
     ));
     configure_labels(&mut runtime_config);
-    runtime_config.workdir = "/sandbox".to_owned();
     runtime_config.lifecycle.idle_after = Duration::from_secs(300);
     runtime_config.lifecycle.retain_for = Duration::from_secs(3600);
     runtime_config.lifecycle.ready_timeout = Duration::from_secs(120);

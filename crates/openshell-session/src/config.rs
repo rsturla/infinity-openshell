@@ -191,8 +191,8 @@ pub struct RuntimeConfig {
     ///
     /// Mutually exclusive with [`TemplatePolicy::default`]. The image must be
     /// visible to the gateway's compute driver and must contain the tools the
-    /// agent runs. OpenShell uses the image's `WORKDIR` as the workspace, so
-    /// [`RuntimeConfig::workdir`] must name a writable directory in the image.
+    /// agent runs. The runtime uses the sandbox workspace that OpenShell
+    /// selects for the image unless [`RuntimeConfig::workdir`] overrides it.
     pub image: Option<String>,
     /// Provider instances attached to every sandbox this runtime creates.
     ///
@@ -224,7 +224,12 @@ pub struct RuntimeConfig {
     /// Additional labels added to every sandbox this runtime creates.
     pub labels: BTreeMap<String, String>,
     /// Working directory inside the sandbox.
-    pub workdir: String,
+    ///
+    /// `None` uses the sandbox workspace that OpenShell selected for the
+    /// image and driver. Set `Some(path)` to run commands in a subdirectory or
+    /// to override a workspace that OpenShell reports differently from the
+    /// driver default. A configured path must be absolute and writable.
+    pub workdir: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -243,7 +248,7 @@ impl RuntimeConfig {
             managed_by: "openshell-session".to_owned(),
             label_prefix: "openshell-session".to_owned(),
             labels: BTreeMap::new(),
-            workdir: "/sandbox".to_owned(),
+            workdir: None,
         }
     }
 
@@ -264,13 +269,15 @@ impl RuntimeConfig {
                 "gateway workspace must not be empty".to_owned(),
             ));
         }
-        if self.workdir.trim().is_empty() {
-            return Err(Error::InvalidConfig("workdir must not be empty".to_owned()));
-        }
-        if !self.workdir.starts_with('/') {
-            return Err(Error::InvalidConfig(
-                "workdir must be an absolute path inside the sandbox".to_owned(),
-            ));
+        if let Some(workdir) = &self.workdir {
+            if workdir.trim().is_empty() {
+                return Err(Error::InvalidConfig("workdir must not be empty".to_owned()));
+            }
+            if !workdir.starts_with('/') {
+                return Err(Error::InvalidConfig(
+                    "workdir must be an absolute path inside the sandbox".to_owned(),
+                ));
+            }
         }
         if self.lifecycle.idle_after.is_zero() {
             return Err(Error::InvalidConfig(
@@ -437,6 +444,16 @@ mod tests {
         config.snapshot.archive_on_delete = true;
         assert!(config.validate().is_err());
         config.snapshot.archive_on_delete = false;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn workdir_defaults_to_the_sandbox_workspace() {
+        let mut config = RuntimeConfig::new(gateway());
+        assert!(config.validate().is_ok());
+        config.workdir = Some("relative/path".to_owned());
+        assert!(config.validate().is_err());
+        config.workdir = Some("/app".to_owned());
         config.validate().unwrap();
     }
 

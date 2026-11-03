@@ -24,7 +24,7 @@ use crate::ids::{SandboxName, SandboxPath};
 pub struct OpenShellGateway {
     client: OpenShellClient,
     workspace: String,
-    workdir: String,
+    workdir: Option<String>,
     policy: Option<proto::SandboxPolicy>,
     exec_timeout: Duration,
     control_timeout: Duration,
@@ -330,7 +330,10 @@ impl Gateway for OpenShellGateway {
                 workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 sandbox: name.as_str().to_owned(),
                 command: request.argv,
-                workdir: request.workdir.unwrap_or_else(|| self.workdir.clone()),
+                workdir: request
+                    .workdir
+                    .or_else(|| self.workdir.clone())
+                    .unwrap_or_default(),
                 environment: request.env.into_iter().collect(),
                 execution_timeout: Some(execution_timeout),
                 stdin: request
@@ -380,7 +383,7 @@ impl Gateway for OpenShellGateway {
                         "sh".to_owned(),
                         path.as_str().to_owned(),
                     ],
-                    workdir: Some(self.workdir.clone()),
+                    workdir: self.workdir.clone(),
                     env: BTreeMap::new(),
                     stdin: None,
                     timeout: Some(self.exec_timeout),
@@ -422,7 +425,7 @@ impl Gateway for OpenShellGateway {
                         "sh".to_owned(),
                         path.as_str().to_owned(),
                     ],
-                    workdir: Some(self.workdir.clone()),
+                    workdir: self.workdir.clone(),
                     env: BTreeMap::new(),
                     stdin: Some(bytes),
                     timeout: Some(self.exec_timeout),

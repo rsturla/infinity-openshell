@@ -49,7 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         GatewayAuth::OidcSource { source },
     ));
     config.image = Some(image.clone());
-    config.workdir = "/sandbox".to_owned();
     config.lifecycle.idle_after = Duration::from_secs(60);
     config.lifecycle.retain_for = Duration::from_secs(3600);
     config.lifecycle.ready_timeout = Duration::from_secs(180);

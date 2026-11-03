@@ -70,7 +70,7 @@ extra start is cheaper than archiving on every idle stop.
 The runtime exports with:
 
 ```shell
-tar -C <workdir> --exclude=./.openshell-snapshot -cf - .
+tar --exclude=./.openshell-snapshot -cf - .
 ```
 
 It writes the stream to `temp_dir`, enforces `max_archive_bytes`, and calls
@@ -81,7 +81,7 @@ Restore uploads the archive in chunks of at most 4 MiB (also bounded by
 
 ```shell
 tar --no-same-owner --no-same-permissions --touch --no-overwrite-dir \
-  -xf .openshell-snapshot/archive.tar -C <workdir>
+  -xf .openshell-snapshot/archive.tar -C .
 ```
 
 The chunk upload uses the normal file-write path, so it works on every
@@ -92,19 +92,19 @@ The image must contain `sh` and `tar`. The built-in Ubuntu image does.
 
 ## What is archived
 
-The runtime archives `RuntimeConfig::workdir`. That path must match the sandbox
-workspace. The command is:
+The runtime archives the command working directory. By default that is the
+sandbox workspace that OpenShell selected. The command is:
 
 ```shell
-tar -C <workdir> --exclude=./.openshell-snapshot -cf - .
+tar --exclude=./.openshell-snapshot -cf - .
 ```
 
-It includes every file and directory under that root, including hidden files.
-It excludes only the temporary restore directory.
+It includes every file and directory under the working directory, including
+hidden files. It excludes only the temporary restore directory.
 
 It does not include:
 
-- the image, installed packages, or anything outside `workdir`;
+- the image, installed packages, or anything outside the working directory;
 - `/tmp`, `/home`, `/var`, or another mount outside the workspace;
 - process memory or environment variables;
 - provider credentials.
@@ -115,18 +115,17 @@ OpenShell chooses the workspace in two ways:
   `/sandbox` uses `/sandbox`.
 - Kubernetes and MicroVM always use `/sandbox`.
 
-`RuntimeConfig::workdir` is not derived from the image, template, or policy. It
-defaults to `/sandbox` and is passed on every exec, read, write, and archive. Set
-it to the workspace path for the driver and image. A smaller `workdir` archives a
-smaller subtree.
+`RuntimeConfig::workdir` defaults to `None`, which uses the sandbox workspace.
+Set `Some(path)` to run commands and archives in a subdirectory or to override
+the workspace. A smaller override archives a smaller subtree.
 
 The archive is a live view. A background writer can make it inconsistent. Stop
 the workload or use a driver volume snapshot when the workspace contains a
 database or another file that needs a consistent copy.
 
-Restore extracts into the same `workdir`. The replacement image must provide a
-compatible environment. Archive ownership and exact modes are not restored,
-because the sandbox user cannot set arbitrary owners.
+Restore extracts into the same working directory. The replacement image must
+provide a compatible environment. Archive ownership and exact modes are not
+restored, because the sandbox user cannot set arbitrary owners.
 
 ## Avoiding tar in the image
 
