@@ -90,6 +90,57 @@ compute driver. Large archives take one exec per chunk. Raise
 
 The image must contain `sh` and `tar`. The built-in Ubuntu image does.
 
+## What is archived
+
+The runtime archives `RuntimeConfig::workdir`. That path must match the sandbox
+workspace. The command is:
+
+```shell
+tar -C <workdir> --exclude=./.openshell-snapshot -cf - .
+```
+
+It includes every file and directory under that root, including hidden files.
+It excludes only the temporary restore directory.
+
+It does not include:
+
+- the image, installed packages, or anything outside `workdir`;
+- `/tmp`, `/home`, `/var`, or another mount outside the workspace;
+- process memory or environment variables;
+- provider credentials.
+
+OpenShell uses the image `WORKDIR` as the workspace, or `/sandbox` when the
+image has none. Set `workdir` to the same path. A smaller `workdir` archives a
+smaller subtree.
+
+The archive is a live view. A background writer can make it inconsistent. Stop
+the workload or use a driver volume snapshot when the workspace contains a
+database or another file that needs a consistent copy.
+
+Restore extracts into the same `workdir`. The replacement image must provide a
+compatible environment. Archive ownership and exact modes are not restored,
+because the sandbox user cannot set arbitrary owners.
+
+## Avoiding tar in the image
+
+`sh` and `tar` are the portable default. Other options:
+
+- **Driver volume.** Mount a per-thread PVC or named volume at the workspace and
+  keep it across sandbox deletion. No copy and no in-image tool. This needs
+  driver configuration and a volume lifecycle outside this crate.
+- **SFTP.** `CreateSshSession` exposes the supervisor SFTP helper. A server-side
+  SFTP client can list and transfer files without `tar`. The Rust SDK does not
+  expose SFTP; the Go SDK does.
+- **Injected helper.** Write a statically linked archiver into the workspace,
+  make it executable, and run it. This removes the image dependency but ships a
+  binary.
+- **Custom command.** The archive and restore commands are currently fixed. A
+  transfer seam would let an image use `busybox tar`, `bsdtar`, or a driver
+  snapshot instead.
+
+`tar` is the default because it is present in the base image, preserves
+metadata, and streams without a server-side copy of each file.
+
 ## Security
 
 - An archive contains everything in the workspace, including secrets the
