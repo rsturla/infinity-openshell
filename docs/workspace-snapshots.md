@@ -109,8 +109,15 @@ It does not include:
 - process memory or environment variables;
 - provider credentials.
 
-OpenShell uses the image `WORKDIR` as the workspace, or `/sandbox` when the
-image has none. Set `workdir` to the same path. A smaller `workdir` archives a
+OpenShell chooses the workspace in two ways:
+
+- Docker and Podman use the image `WORKDIR`. An image with no `WORKDIR`, `/`, or
+  `/sandbox` uses `/sandbox`.
+- Kubernetes and MicroVM always use `/sandbox`.
+
+`RuntimeConfig::workdir` is not derived from the image, template, or policy. It
+defaults to `/sandbox` and is passed on every exec, read, write, and archive. Set
+it to the workspace path for the driver and image. A smaller `workdir` archives a
 smaller subtree.
 
 The archive is a live view. A background writer can make it inconsistent. Stop

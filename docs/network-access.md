@@ -142,8 +142,10 @@ The image must meet these conditions:
   sets `process_policy.run_as_user`.
 - It contains the client binaries that the policy and profile name. The built-in
   Ubuntu image is minimal and has no `curl`, `wget`, or `python3`.
-- The workspace directory is writable. OpenShell uses the image `WORKDIR`, or
-  `/sandbox` when the image has none. Keep `RuntimeConfig::workdir` aligned.
+- The workspace directory is writable. Docker and Podman use the image
+  `WORKDIR`, or `/sandbox` when the image has none or `/`. Kubernetes and
+  MicroVM always use `/sandbox`. Keep `RuntimeConfig::workdir` aligned; it is
+  not auto-detected.
 
 ## CLI alternative
 
