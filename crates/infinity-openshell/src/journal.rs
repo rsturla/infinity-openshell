@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use rap_protocol::{RapInvocation, RapToolResult, ToolCallId};
@@ -17,6 +18,7 @@ use crate::error::Error;
 
 /// Result of accepting an invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Accept {
     /// The invocation is new and must be processed.
     New,
@@ -143,6 +145,7 @@ impl Journal for MemoryJournal {
 pub struct FileJournal {
     state: Mutex<HashMap<String, Record>>,
     file: Mutex<tokio::fs::File>,
+    poisoned: AtomicBool,
 }
 
 impl FileJournal {
@@ -222,14 +225,33 @@ impl FileJournal {
             })?;
         }
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .map_err(|error| {
-                Error::Journal(format!("cannot open journal '{}': {error}", path.display()))
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path).await.map_err(|error| {
+            Error::Journal(format!("cannot open journal '{}': {error}", path.display()))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = file.metadata().await.map_err(|error| {
+                Error::Journal(format!(
+                    "cannot inspect journal '{}': {error}",
+                    path.display()
+                ))
             })?;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                file.set_permissions(permissions).await.map_err(|error| {
+                    Error::Journal(format!(
+                        "cannot restrict journal '{}': {error}",
+                        path.display()
+                    ))
+                })?;
+            }
+        }
 
         // A valid final record without a trailing newline would otherwise
         // concatenate with the next append and corrupt the journal.
@@ -251,23 +273,44 @@ impl FileJournal {
         Ok(Self {
             state: Mutex::new(state),
             file: Mutex::new(file),
+            poisoned: AtomicBool::new(false),
         })
     }
 
     async fn append(&self, record: &LogRecord) -> Result<(), Error> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(Error::Journal(
+                "journal is poisoned after a failed write; restart the server".to_owned(),
+            ));
+        }
         let mut line = serde_json::to_vec(record)
             .map_err(|error| Error::Journal(format!("cannot serialize journal record: {error}")))?;
         line.push(b'\n');
         let mut file = self.file.lock().await;
-        file.write_all(&line)
+        let offset = file
+            .metadata()
             .await
-            .map_err(|error| Error::Journal(format!("cannot append journal record: {error}")))?;
-        file.flush()
-            .await
-            .map_err(|error| Error::Journal(format!("cannot flush journal: {error}")))?;
-        file.sync_data()
-            .await
-            .map_err(|error| Error::Journal(format!("cannot sync journal: {error}")))?;
+            .map_err(|error| Error::Journal(format!("cannot inspect journal length: {error}")))?
+            .len();
+        let result = async {
+            file.write_all(&line).await?;
+            file.flush().await?;
+            file.sync_data().await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            if let Err(rollback) = file.set_len(offset).await {
+                self.poisoned.store(true, Ordering::SeqCst);
+                return Err(Error::Journal(format!(
+                    "cannot append journal record: {error}; truncate failed: {rollback}"
+                )));
+            }
+            let _ = file.sync_data().await;
+            return Err(Error::Journal(format!(
+                "cannot append journal record: {error}"
+            )));
+        }
         Ok(())
     }
 }
@@ -577,6 +620,33 @@ mod tests {
             journal.accept(&replacement).await.unwrap(),
             Accept::DuplicatePending
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_journal_is_private_and_tightens_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.jsonl");
+        tokio::fs::write(&path, b"").await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+
+        let journal = FileJournal::open(&path).await.unwrap();
+        journal
+            .accept(&invocation("call-1", "openshell_exec"))
+            .await
+            .unwrap();
+
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[tokio::test]
