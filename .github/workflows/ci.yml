@@ -24,6 +24,11 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-targets --locked
       - run: cargo test --all-targets --all-features --locked
+      - run: cargo test --doc --all-features --locked
+      - run: cargo check -p openshell-session --no-default-features --locked
+      - run: cargo check -p openshell-session --no-default-features --features testkit --locked
+      - run: cargo check -p openshell-session --no-default-features --features bootstrap --locked
+      - run: cargo check -p openshell-session --no-default-features --features testkit,bootstrap --locked
       - run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
